@@ -1,0 +1,21 @@
+[package]
+name = "agentcoffeechat-cli"
+version = "0.1.0"
+edition = "2021"
+description = "AgentCoffeeChat CLI — macOS command-line interface for peer-to-peer coffee chats"
+
+[[bin]]
+name = "agentcoffeechat"
+path = "src/main.rs"
+
+[[bin]]
+name = "acc"
+path = "src/main.rs"
+
+[dependencies]
+agentcoffeechat-core = { path = "../agentcoffeechat-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+crossterm = "0.28"
+indicatif = "0.17"
+dirs = "5"

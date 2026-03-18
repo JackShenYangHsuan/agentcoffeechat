@@ -1,0 +1,14 @@
+[package]
+name = "agentcoffeechat-menubar"
+version = "0.1.0"
+edition = "2021"
+description = "AgentCoffeeChat Menu Bar — macOS status icon and peer status display"
+
+[[bin]]
+name = "agentcoffeechat-menubar"
+path = "src/main.rs"
+
+[dependencies]
+agentcoffeechat-core = { path = "../agentcoffeechat-core" }
+tao = "0.32"
+tray-icon = "0.19"

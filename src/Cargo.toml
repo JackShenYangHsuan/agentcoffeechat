@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "agentcoffeechat-cli",
+    "agentcoffeechat-daemon",
+    "agentcoffeechat-core",
+    "agentcoffeechat-menubar",
+]
+resolver = "2"
+
+# Release profile: optimize for binary size (plan §12 Week 6)
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true          # link-time optimization
+codegen-units = 1   # single codegen unit for best optimization
+strip = true        # strip debug symbols

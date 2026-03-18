@@ -1,0 +1,28 @@
+# Build artifacts
+src/target/
+*.o
+*.d
+*.dylib
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Release artifacts
+dist/
+*.tar.gz
+
+# Internal docs (not for public repo)
+agentcoffeechat-v1-plan.md
+brainstorm-context.md
+
+# Test scripts and data
+test.sh
+smoke-test-fresh-machine.sh
+brew-install-local.sh
+src/agentcoffeechat-daemon/tests/
