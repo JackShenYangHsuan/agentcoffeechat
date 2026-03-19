@@ -63,55 +63,36 @@ impl Default for DaemonConfig {
         // Derive a display name from the username.
         let display_name = std::env::var("USER").unwrap_or_else(|_| "agent".to_string());
 
-        // Try to derive fingerprint_prefix from a real Ed25519 identity stored
-        // in the macOS Keychain.  Fall back to a hostname hash if Keychain
-        // access fails (e.g. headless CI, sandbox, Linux).
-        let fingerprint_prefix =
-            match agentcoffeechat_core::identity::get_or_create_identity() {
-                Ok(identity) => {
-                    println!(
-                        "[daemon] Identity fingerprint: {}",
-                        identity.fingerprint
-                    );
-                    identity.fingerprint_prefix
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[daemon] Keychain identity unavailable ({}), falling back to hostname hash",
-                        e
-                    );
-                    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
-                        let mut buf = [0u8; 256];
-                        let rc = unsafe {
-                            libc::gethostname(
-                                buf.as_mut_ptr() as *mut libc::c_char,
-                                buf.len(),
-                            )
-                        };
-                        if rc == 0 {
-                            let len =
-                                buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                            String::from_utf8_lossy(&buf[..len]).to_string()
-                        } else {
-                            "unknown".to_string()
-                        }
-                    });
-                    format!(
-                        "{:0>16x}",
-                        hostname
-                            .as_bytes()
-                            .iter()
-                            .fold(0u64, |acc, &b| acc
-                                .wrapping_mul(31)
-                                .wrapping_add(b as u64))
-                    )
-                }
+        // Derive fingerprint from username + hostname. This avoids the macOS
+        // Keychain prompt which blocks indefinitely when the daemon runs
+        // without a GUI context (stdout/stderr redirected to log file).
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+            let mut buf = [0u8; 256];
+            let rc = unsafe {
+                libc::gethostname(
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
             };
+            if rc == 0 {
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                String::from_utf8_lossy(&buf[..len]).to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+        let seed = format!("{}-{}", display_name, hostname);
+        let fingerprint_prefix = format!(
+            "{:0>16x}",
+            seed.as_bytes()
+                .iter()
+                .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+        );
 
         Self {
             display_name,
             fingerprint_prefix,
-            ai_tool: agentcoffeechat_core::plugin::detect_ai_tool().to_string().to_lowercase().replace(' ', "-"),
+            ai_tool: "claude-code".to_string(),
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_hash: [0x00, 0x00, 0x00, 0x00], // overridden by load()
         }
@@ -971,12 +952,13 @@ async fn check_ble_status() -> (bool, String) {
 }
 
 fn check_mdns_status() -> (bool, String) {
+    // Try to create an mdns-sd ServiceDaemon — if it succeeds, mDNS is available.
     match mdns_sd::ServiceDaemon::new() {
         Ok(daemon) => {
             let _ = daemon.shutdown();
-            (true, "Bonjour/mDNS is available".to_string())
+            (true, "Bonjour/mDNS is available (mdns-sd)".to_string())
         }
-        Err(e) => (false, format!("Bonjour/mDNS not available: {}", e)),
+        Err(e) => (false, format!("mDNS not available: {}", e)),
     }
 }
 
@@ -1144,7 +1126,9 @@ async fn main() -> Result<()> {
     println!("[daemon] agentcoffeechatd starting");
     println!("[daemon] Listening on {}", sock_path.display());
 
+    println!("[daemon] Loading config...");
     let config = DaemonConfig::load();
+    println!("[daemon] Config loaded: ai_tool={}, project_root={}", config.ai_tool, config.project_root.display());
 
     // Ensure config.json exists (first-run creation).
     {
