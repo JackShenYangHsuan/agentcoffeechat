@@ -57,9 +57,27 @@ impl SessionManager {
         self.sessions.keys().cloned().collect()
     }
 
-    /// Look up a session by peer name.
+    /// Look up a session by peer name (exact match first, then prefix match).
     pub fn get_session(&self, peer_name: &str) -> Option<&Session> {
-        self.sessions.get(peer_name)
+        // Exact match first.
+        if let Some(s) = self.sessions.get(peer_name) {
+            return Some(s);
+        }
+        // Fuzzy: peer_name might include a suffix like "(2)" or a fingerprint.
+        // Try matching by prefix: "jackshen" matches "jackshen-93bd6a8c".
+        // Also try the reverse: "jackshen-93bd6a8c" matches stored "jackshen".
+        for (key, session) in &self.sessions {
+            if key.starts_with(peer_name) || peer_name.starts_with(key) {
+                return Some(session);
+            }
+            // Match by fingerprint if the session has one.
+            if let Some(ref fp) = session.fingerprint_prefix {
+                if peer_name.contains(&fp[..8.min(fp.len())]) {
+                    return Some(session);
+                }
+            }
+        }
+        None
     }
 
     /// Create (or replace) a session for the given peer.
