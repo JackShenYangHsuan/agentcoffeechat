@@ -52,12 +52,6 @@ pub enum DaemonCommand {
     },
     /// Run diagnostics
     RunDoctor,
-    /// List pending incoming connection requests awaiting approval
-    ListPending,
-    /// Approve a pending connection request
-    ApproveConnection { peer_name: String },
-    /// Deny a pending connection request
-    DenyConnection { peer_name: String },
     /// Update daemon project/tool context from the current CLI invocation
     UpdateContext {
         project_root: String,
