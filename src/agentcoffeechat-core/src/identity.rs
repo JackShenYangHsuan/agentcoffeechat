@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -99,11 +99,21 @@ fn generate_and_store_key() -> Result<SigningKey> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    // Write private key with restrictive permissions (0600).
-    std::fs::write(&key_path, signing_key.as_bytes())
-        .with_context(|| format!("failed to write {}", key_path.display()))?;
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to set permissions on {}", key_path.display()))?;
+    // Write private key with restrictive permissions (0600) atomically —
+    // OpenOptions with mode() creates the file with correct permissions from
+    // the start, avoiding a window where the key is world-readable.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .with_context(|| format!("failed to create {}", key_path.display()))?;
+        f.write_all(signing_key.as_bytes())
+            .with_context(|| format!("failed to write {}", key_path.display()))?;
+    }
 
     // Write public key for easy inspection.
     if let Err(e) = save_public_key_file(&signing_key) {

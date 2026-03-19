@@ -165,7 +165,8 @@ pub async fn run_prompt(
         .current_dir(project_root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
 
     if let Some(prompt_text) = system_prompt {
         command.env("CLAUDE_SYSTEM_PROMPT", prompt_text);

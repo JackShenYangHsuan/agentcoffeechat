@@ -208,6 +208,90 @@ fn update_daemon_context(client: &mut IpcClient) {
 // Command handlers
 // ---------------------------------------------------------------------------
 
+/// Show welcome message with available commands and nearby peer status.
+fn show_welcome_and_commands(client: &mut Option<IpcClient>) {
+    println!("  \x1b[1mAgentCoffeeChat\x1b[0m \u{2014} Coffee chats for AI coding agents\n");
+
+    // Show detected AI tool status.
+    let detected = detect_ai_tool();
+    match detected {
+        agentcoffeechat_core::AiTool::Unknown => {
+            println!("  \x1b[33m\u{26A0}\x1b[0m Warning: no AI tool detected \u{2014} chats won't work.");
+        }
+        _ => {
+            println!("  \x1b[32m\u{25CF}\x1b[0m Detected: {}", detected);
+        }
+    }
+
+    // Check for nearby peers and active sessions.
+    let mut peer_count = 0usize;
+    let mut session_count = 0usize;
+    let mut peer_names: Vec<String> = Vec::new();
+    let mut session_names: Vec<String> = Vec::new();
+
+    if let Some(ref mut c) = client {
+        if let Ok(resp) = c.send(&DaemonCommand::ListPeers) {
+            if let Some(data) = &resp.data {
+                if let Some(arr) = data.as_array() {
+                    peer_count = arr.len();
+                    for p in arr.iter().take(3) {
+                        if let Some(name) = p.get("name").and_then(|v| v.as_str()) {
+                            peer_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(resp) = c.send(&DaemonCommand::ListSessions) {
+            if let Some(data) = &resp.data {
+                if let Some(arr) = data.as_array() {
+                    session_count = arr.len();
+                    for s in arr.iter().take(3) {
+                        if let Some(name) = s.get("peer_name").and_then(|v| v.as_str()) {
+                            session_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Status line
+    if session_count > 0 {
+        println!("  \x1b[32m\u{25CF}\x1b[0m {} active session(s): {}", session_count, session_names.join(", "));
+    }
+    if peer_count > 0 {
+        println!("  \x1b[32m\u{25CF}\x1b[0m {} peer(s) nearby: {}", peer_count, peer_names.join(", "));
+    } else {
+        println!("  \x1b[90m\u{25CB}\x1b[0m No peers nearby yet. They'll appear when someone runs 'acc start'.");
+    }
+    println!();
+
+    // Commands
+    println!("  \x1b[1mCommands:\x1b[0m");
+    println!("    acc peers                  \x1b[90m\u{2014} See who's nearby\x1b[0m");
+    println!("    acc connect <name>         \x1b[90m\u{2014} Connect to a peer (starts 1-hour session)\x1b[0m");
+    println!("    acc chat --to <name>       \x1b[90m\u{2014} Start a coffee chat\x1b[0m");
+    println!("    acc ask <name> \"question\"  \x1b[90m\u{2014} Ask a quick question (~30s)\x1b[0m");
+    println!("    acc history                \x1b[90m\u{2014} View past chats and briefings\x1b[0m");
+    println!("    acc sessions               \x1b[90m\u{2014} List active sessions\x1b[0m");
+    println!("    acc disconnect [name]      \x1b[90m\u{2014} End a session\x1b[0m");
+    println!("    acc doctor                 \x1b[90m\u{2014} Run diagnostics\x1b[0m");
+    println!("    acc invite                 \x1b[90m\u{2014} Get setup instructions for peers\x1b[0m");
+    println!("    acc stop                   \x1b[90m\u{2014} Stop the daemon\x1b[0m");
+    println!();
+
+    // Next step nudge
+    if session_count > 0 && !session_names.is_empty() {
+        let first_session = &session_names[0];
+        println!("  \x1b[1mNext:\x1b[0m Say 'chat with {}' or run: acc chat --to {}", first_session, first_session);
+    } else if peer_count > 0 {
+        println!("  \x1b[1mNext:\x1b[0m Connect to a peer: acc connect {}", peer_names[0]);
+    } else {
+        println!("  \x1b[1mNext:\x1b[0m Share setup instructions: acc invite");
+    }
+}
+
 fn handle_start(json: bool, verbose: bool) {
     // --- Plugin installation (idempotent) — install for ALL detected tools ---
     let detected_tools = detect_all_ai_tools();
@@ -258,7 +342,8 @@ fn handle_start(json: bool, verbose: bool) {
                     });
                     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_else(|_| "{}".to_string()));
                 } else {
-                    println!("Daemon is already running. Context refreshed.");
+                    println!("Daemon is already running. Context refreshed.\n");
+                    show_welcome_and_commands(&mut Some(client));
                 }
                 return;
             }
@@ -323,7 +408,8 @@ fn handle_start(json: bool, verbose: bool) {
                     });
                     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_else(|_| "{}".to_string()));
                 } else {
-                    println!("Daemon started successfully.");
+                    println!("Daemon started successfully.\n");
+                    show_welcome_and_commands(&mut try_connect());
                 }
             } else if json {
                 let r = serde_json::json!({
@@ -369,7 +455,40 @@ fn handle_status(json: bool) {
 fn handle_peers(json: bool) {
     let mut client = connect_or_exit(json);
     let resp = send_or_exit(&mut client, &DaemonCommand::ListPeers, json);
-    print_response(&resp, json);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string()));
+        return;
+    }
+
+    if resp.ok {
+        if let Some(data) = &resp.data {
+            if let Some(arr) = data.as_array() {
+                if arr.is_empty() {
+                    println!("No peers discovered yet.\n");
+                    println!("  \x1b[90mPeers appear when someone nearby runs 'acc start'.\x1b[0m");
+                    println!("  \x1b[1mNext:\x1b[0m Share setup instructions: acc invite");
+                } else {
+                    println!("{} peer(s) nearby:\n", arr.len());
+                    for p in arr {
+                        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let source = p.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("  \x1b[32m\u{25CF}\x1b[0m {}  \x1b[90m({})\x1b[0m", name, source);
+                    }
+                    let first_name = arr.first()
+                        .and_then(|p| p.get("name").and_then(|v| v.as_str()))
+                        .unwrap_or("peer");
+                    println!("\n  \x1b[1mNext:\x1b[0m Connect to a peer: acc connect {}", first_name);
+                }
+            } else {
+                print_response(&resp, false);
+            }
+        } else {
+            print_response(&resp, false);
+        }
+    } else {
+        print_response(&resp, false);
+    }
 }
 
 fn handle_sessions(json: bool) {
@@ -475,7 +594,16 @@ fn handle_connect(name: &str, peer_code: Option<&str>, json: bool) {
         },
         json,
     );
-    print_response(&resp, json);
+
+    if resp.ok {
+        println!("\n  \x1b[32m\u{2713}\x1b[0m Connected to {} \u{2014} session active for 1 hour.\n", name);
+        println!("  \x1b[1mWhat you can do now:\x1b[0m");
+        println!("    acc chat --to {}       \x1b[90m\u{2014} Start a coffee chat (3\u{2013}5 min)\x1b[0m", name);
+        println!("    acc ask {} \"question\"  \x1b[90m\u{2014} Ask a quick question (~30s)\x1b[0m", name);
+        println!("    acc disconnect {}      \x1b[90m\u{2014} End the session\x1b[0m", name);
+    } else {
+        print_response(&resp, json);
+    }
 }
 
 fn handle_disconnect(name: Option<&str>, json: bool) {
@@ -523,9 +651,15 @@ fn handle_disconnect(name: Option<&str>, json: bool) {
         }
     };
 
-    let cmd = DaemonCommand::EndSession { peer_name };
+    let cmd = DaemonCommand::EndSession { peer_name: peer_name.clone() };
     let resp = send_or_exit(&mut client, &cmd, json);
-    print_response(&resp, json);
+
+    if !json && resp.ok {
+        println!("  \x1b[90m\u{2717}\x1b[0m Disconnected from {}.", peer_name);
+        println!("\n  \x1b[1mNext:\x1b[0m Reconnect anytime: acc connect {}", peer_name);
+    } else {
+        print_response(&resp, json);
+    }
 }
 
 fn handle_ask(name: &str, question: &str, json: bool) {
@@ -536,7 +670,7 @@ fn handle_ask(name: &str, question: &str, json: bool) {
     };
 
     if !json {
-        println!("Asking {}...", name);
+        println!("  Asking {}'s agent... (typically 10\u{2013}30s)", name);
     }
 
     let resp = send_or_exit(&mut client, &cmd, json);
@@ -549,11 +683,13 @@ fn handle_ask(name: &str, question: &str, json: bool) {
                 println!("\n{}", answer);
             }
             if let Some(ms) = data.get("duration_ms").and_then(|v| v.as_u64()) {
-                println!("\n(answered in {}ms)", ms);
+                let secs = ms / 1000;
+                println!("\n  \x1b[90m{}'s agent responded in {}s.\x1b[0m", name, secs);
             }
         } else if let Some(msg) = &resp.message {
             println!("{}", msg);
         }
+        println!("\n  \x1b[1mNext:\x1b[0m Want a deeper conversation? Run: acc chat --to {}", name);
     } else if let Some(msg) = &resp.message {
         eprintln!("Error: {}", msg);
     }
@@ -640,11 +776,22 @@ fn handle_chat(to: Option<&str>, dry_run: bool, json: bool) {
     // --- Interactive TUI mode ---
     let display = chat_ui::ChatDisplay::new(&peer_name);
 
-    display.show_status(&format!("Starting coffee chat with '{}'...", peer_name));
-    display.show_status("This may take a few minutes. The agents will converse autonomously.");
+    println!();
+    display.show_status(&format!(
+        "Starting coffee chat with '{}'", peer_name
+    ));
+    display.show_status("Your agents will have a structured conversation:");
+    display.show_status("  1. Introductions \u{2014} project, setup, current work");
+    display.show_status("  2. Deep Dive \u{2014} architecture, what worked, what failed");
+    display.show_status("  3. Compare & Collaborate \u{2014} setup diffs, overlaps");
+    display.show_status("  4. Blindspots & Tips \u{2014} gaps, recommendations");
+    display.show_status("  5. Wrap-up \u{2014} key takeaways");
+    display.show_status("  6. Synthesize \u{2014} generate your pre-meeting briefing");
+    println!();
+    display.show_status("This typically takes 3\u{2013}5 minutes. Sit back and relax.");
     println!();
 
-    let spinner = display.show_spinner(&format!("Chatting with {}...", peer_name));
+    let spinner = display.show_spinner("Agents connecting...");
 
     let cmd = DaemonCommand::StartChat {
         peer_name: peer_name.clone(),
@@ -711,7 +858,8 @@ fn handle_history(number: Option<u32>, show_briefing: bool, json: bool) {
             if let Some(data) = &resp.data {
                 if let Some(arr) = data.as_array() {
                     if arr.is_empty() {
-                        println!("No past chats found.");
+                        println!("No past chats found.\n");
+                        println!("  \x1b[1mNext:\x1b[0m Start a coffee chat: acc chat --to <name>");
                     } else {
                         for entry in arr {
                             let idx = entry.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -720,7 +868,9 @@ fn handle_history(number: Option<u32>, show_briefing: bool, json: bool) {
                             let summary = entry.get("summary").and_then(|v| v.as_str()).unwrap_or("");
                             println!("  [{}] {} ({}) - {}", idx, peer, ts, summary);
                         }
-                        println!("\nUse 'agentcoffeechat history <index>' to view details.");
+                        println!();
+                        println!("  \x1b[1mView details:\x1b[0m  acc history <index>");
+                        println!("  \x1b[1mView briefing:\x1b[0m acc history <index> --briefing");
                     }
                 }
             }
@@ -844,7 +994,11 @@ fn handle_doctor(json_mode: bool) {
     );
 
     if fail_count > 0 {
+        println!("\n  \x1b[1mNext:\x1b[0m Fix the failing checks above, then run: acc doctor");
         std::process::exit(1);
+    } else {
+        println!("\n  \x1b[32m\u{2713} Everything healthy.\x1b[0m");
+        println!("  \x1b[1mNext:\x1b[0m See who's nearby: acc peers");
     }
 }
 

@@ -3,8 +3,10 @@
 //
 // Storage layout:
 //   ~/.agentcoffeechat/chats/<peer>-<timestamp>/
-//       transcript.md
-//       briefing.md
+//       transcript.md         — Full chat transcript
+//       briefing.md           — Legacy briefing (backward compat)
+//       briefing-human.md     — Human-facing pre-meeting note
+//       briefing-agent.json   — Structured agent memo (machine-actionable)
 
 use std::path::{Path, PathBuf};
 
@@ -131,7 +133,14 @@ pub fn load_recent_briefings(peer_name: &str, max: usize) -> Result<Vec<String>>
 
     let mut briefings = Vec::new();
     for dir in matching_dirs.into_iter().take(max) {
-        let briefing_path = dir.join("briefing.md");
+        // Prefer the richer human briefing format; fall back to legacy.
+        let human_path = dir.join("briefing-human.md");
+        let legacy_path = dir.join("briefing.md");
+        let briefing_path = if human_path.exists() {
+            human_path
+        } else {
+            legacy_path
+        };
         if briefing_path.exists() {
             let content = std::fs::read_to_string(&briefing_path)
                 .with_context(|| format!("failed to read {}", briefing_path.display()))?;
@@ -223,7 +232,7 @@ fn format_transcript(messages: &[Message], peer_name: &str, duration_secs: u64) 
     out.push_str("---\n\n");
 
     for msg in messages {
-        let speaker = if msg.from.name == "peer" {
+        let speaker = if msg.from.name == crate::chat_engine::PEER_SENDER_NAME {
             peer_name
         } else {
             &msg.from.name

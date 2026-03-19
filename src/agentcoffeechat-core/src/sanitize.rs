@@ -42,6 +42,8 @@ pub trait SanitizationStage {
 /// Uses simple string matching against path segments and extensions.
 pub struct ExclusionStage {
     patterns: Vec<String>,
+    /// Pre-compiled regex for matching file-path-like tokens in text.
+    path_re: Regex,
 }
 
 impl Default for ExclusionStage {
@@ -69,7 +71,9 @@ impl Default for ExclusionStage {
 
 impl ExclusionStage {
     pub fn new(patterns: Vec<String>) -> Self {
-        Self { patterns }
+        let path_re =
+            Regex::new(r#"(?:^|[\s"'`])(/?\S+(?:/\S+)+|\.[\w]+)"#).unwrap();
+        Self { patterns, path_re }
     }
 
     /// Simple pattern matching against a path string.
@@ -110,17 +114,12 @@ impl SanitizationStage for ExclusionStage {
             return SanitizeResult::pass(text.to_string());
         }
 
-        // Match things that look like file paths (absolute or relative with at
-        // least one `/`, or bare dotfiles like `.env`).
-        let path_re =
-            Regex::new(r#"(?:^|[\s"'`])(/?\S+(?:/\S+)+|\.[\w]+)"#).unwrap();
-
         let mut result = text.to_string();
         let mut redaction_count: usize = 0;
 
         // Collect matches first, then replace in reverse order so byte
         // offsets remain valid.
-        let matches: Vec<(String, usize, usize)> = path_re
+        let matches: Vec<(String, usize, usize)> = self.path_re
             .captures_iter(text)
             .filter_map(|cap| {
                 let m = cap.get(1)?;

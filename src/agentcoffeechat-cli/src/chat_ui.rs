@@ -32,7 +32,10 @@ impl ChatDisplay {
     /// Display a phase header (e.g. "icebreaker", "followup", "wrapup", "briefing").
     pub fn show_phase(&self, phase: &str) {
         let label = match phase {
-            "icebreaker" => "Icebreaker",
+            "icebreaker" | "introductions" => "Introductions",
+            "deep_dive" => "Deep Dive",
+            "compare" => "Compare & Collaborate",
+            "blindspots" => "Blindspots & Tips",
             "followup" => "Follow-up",
             "wrapup" => "Wrap-up",
             "briefing" => "Briefing",
@@ -88,19 +91,19 @@ impl ChatDisplay {
         );
         println!("{}", top.with(Color::White).attribute(Attribute::Bold));
 
-        // Body lines
+        // Body lines — word-wrap long lines instead of truncating.
+        let inner_width = BOX_WIDTH - 4; // "| " + content + " |"
         for line in briefing_text.lines() {
-            let padded = if line.len() < BOX_WIDTH - 4 {
-                format!("{}{}", line, " ".repeat(BOX_WIDTH - 4 - line.len()))
-            } else {
-                line[..BOX_WIDTH - 4].to_string()
-            };
-            println!(
-                "{} {} {}",
-                "\u{2502}".with(Color::White).attribute(Attribute::Bold),
-                padded.with(Color::White),
-                "\u{2502}".with(Color::White).attribute(Attribute::Bold),
-            );
+            for chunk in wrap_text(line, inner_width) {
+                let pad = inner_width.saturating_sub(chunk.len());
+                println!(
+                    "{} {}{} {}",
+                    "\u{2502}".with(Color::White).attribute(Attribute::Bold),
+                    chunk.with(Color::White),
+                    " ".repeat(pad),
+                    "\u{2502}".with(Color::White).attribute(Attribute::Bold),
+                );
+            }
         }
 
         // Bottom border
@@ -171,7 +174,6 @@ impl ChatDisplay {
 
 /// Word-wrap `text` to lines of at most `width` characters, breaking on
 /// whitespace boundaries when possible.
-#[allow(dead_code)]
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -272,6 +274,45 @@ pub fn replay_chat(display: &ChatDisplay, data: &serde_json::Value) {
         println!();
         display.show_status(&format!("Saved to: {}", path));
     }
+
+    // Post-chat nudges.
+    println!();
+    let starter_count = data
+        .get("human_briefing")
+        .and_then(|v| v.get("conversation_starters"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if starter_count > 0 {
+        display.show_status(&format!(
+            "Your briefing has {} conversation starters for meeting {} in person.",
+            starter_count, peer_name
+        ));
+    }
+
+    let action_count = data
+        .get("agent_memo")
+        .and_then(|v| v.get("follow_up_actions"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if action_count > 0 {
+        display.show_status(&format!(
+            "Agent memo has {} follow-up action(s). View: acc history 0 --briefing",
+            action_count
+        ));
+    }
+
+    // Next steps
+    println!();
+    display.show_status("What's next:");
+    display.show_status(&format!(
+        "  acc ask {} \"question\"  \u{2014} Ask a quick follow-up question", peer_name
+    ));
+    display.show_status("  acc history 0 --briefing  \u{2014} Re-read the full briefing");
+    display.show_status(&format!(
+        "  acc chat --to {}        \u{2014} Chat again later", peer_name
+    ));
 }
 
 /// Render the human briefing from JSON data using the ChatDisplay.

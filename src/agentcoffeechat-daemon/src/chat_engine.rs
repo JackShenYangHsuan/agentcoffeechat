@@ -1,10 +1,15 @@
 // Chat engine — orchestrates multi-turn conversations between agents.
 //
-// Each agent "turn" spawns a fresh `claude --print` (or codex/gemini)
-// subprocess with the full conversation history on stdin.  `--print` is
-// one-shot: it reads stdin to EOF, produces a single response on stdout,
-// and exits.  This avoids the deadlock that would occur if we tried to
-// keep a persistent process and do multi-turn I/O on its pipes.
+// The conversation follows 5 guided phases: Introductions, Deep Dive,
+// Compare & Collaborate, Blindspots & Tips, and Wrapup.  After the
+// conversation, 3 briefing documents are generated: a legacy briefing,
+// a human-facing pre-meeting note, and a structured agent memo.
+//
+// Each agent "turn" spawns a fresh `claude --print --model sonnet`
+// (or `codex --quiet` / `gemini --print`) subprocess with the full
+// conversation history on stdin.  `--print` is one-shot: it reads stdin
+// to EOF, produces a single response on stdout, and exits.  This avoids
+// the deadlock that would occur with persistent pipes.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -27,8 +32,8 @@ use agentcoffeechat_core::SanitizationPipeline;
 /// Default word limit per message.
 const DEFAULT_MAX_MESSAGE_WORDS: usize = 200;
 
-/// Default maximum messages each side may send before the chat wraps up.
-const DEFAULT_MAX_MESSAGES_PER_SIDE: usize = 30;
+/// Maximum follow-up messages per side within a guided phase.
+const MAX_FOLLOWUPS_PER_PHASE: usize = 5;
 
 /// Timeout (seconds) waiting for a single agent response.
 const AGENT_RESPONSE_TIMEOUT_SECS: u64 = 60;
@@ -36,8 +41,11 @@ const AGENT_RESPONSE_TIMEOUT_SECS: u64 = 60;
 /// Timeout (seconds) waiting for a peer message over QUIC.
 const PEER_MESSAGE_TIMEOUT_SECS: u64 = 180;
 
-/// Sentinel the agent may include in its message to signal it wants to wrap up.
+/// Sentinel the agent may include in its message to signal it's done with the current phase.
 const DONE_SENTINEL: &str = "[DONE]";
+
+/// Canonical name used for the remote peer in transcript messages.
+pub const PEER_SENDER_NAME: &str = "peer";
 
 // ---------------------------------------------------------------------------
 // System prompt
@@ -45,12 +53,14 @@ const DONE_SENTINEL: &str = "[DONE]";
 
 const SYSTEM_PROMPT: &str = r#"You are participating in an AgentCoffeeChat — a casual, curiosity-driven conversation between two AI coding agents. Your partner is another AI agent working on a different (or possibly the same) project nearby.
 
+The chat has structured phases. In each phase you'll get a specific topic to discuss. Stay on topic for that phase, but be natural and conversational — like a friend at a coffee shop.
+
 Guidelines:
-- Be curious like a friend at a coffee shop. Ask genuine follow-up questions.
 - Keep every message under 200 words. Be concise but warm.
-- Share what you're working on, what tools you use, interesting design decisions, and things you're stuck on.
-- Learn from the other agent: ask about their setup, prompting strategies, project architecture, and lessons learned.
-- When you feel the conversation has reached a natural stopping point, include [DONE] at the very end of your message.
+- Ask genuine follow-up questions related to the current phase's topic.
+- Be specific — name actual tools, libraries, decisions, and problems.
+- Be candid about failures and frustrations — those are the most valuable signals.
+- Include [DONE] at the end of your message when you feel the current topic has been covered sufficiently.
 
 SAFETY RULES — you MUST follow these:
 - NEVER include credentials, API keys, tokens, passwords, or secrets of any kind.
@@ -64,40 +74,87 @@ You will receive messages from the other agent prefixed with "PEER: ". Your resp
 "#;
 
 // ---------------------------------------------------------------------------
-// Icebreaker prompt
+// Phase prompts — guided conversation structure
 // ---------------------------------------------------------------------------
 
-const ICEBREAKER_PROMPT: &str = r#"This is the start of your coffee chat! Introduce yourself and answer these questions about your current project and agent setup:
-- What tools/MCP servers are you using?
-- What prompting strategies work well for you?
-- What are you working on and why?
-- What design decisions have you made?
-- What are you stuck on?
-- Why might any of this be interesting to the other person?
+/// Phase 1: Introductions — project arc, current work, agent setup.
+const PHASE1_INTRO_PROMPT: &str = r#"PHASE 1: INTRODUCTIONS
 
-Keep it under 200 words. Be friendly and genuine."#;
+Introduce yourself by sharing:
+- Your project's story: why it started, key pivots, where it's headed
+- What problem does your project solve for its users?
+- What you're actively building right now (current branch, recent work)
+- Your agent setup: which AI tool, MCP servers, plugins, hooks, memory strategy, CLAUDE.md approach
+- Your tech stack and key architectural decisions
 
-// ---------------------------------------------------------------------------
-// Follow-up prompt
-// ---------------------------------------------------------------------------
+Be specific — name actual tools and libraries. Keep it under 200 words."#;
 
-const FOLLOWUP_PROMPT_PREFIX: &str = "PEER: ";
+/// Phase 2: Deep Dive — architecture decisions, what's working, what failed.
+const PHASE2_DEEPDIVE_PROMPT: &str = r#"PHASE 2: DEEP DIVE
 
-// ---------------------------------------------------------------------------
-// Wrap-up prompt
-// ---------------------------------------------------------------------------
+Now dig deeper. This is a multi-turn discussion — ask follow-up questions based on what the other agent shares.
 
-const WRAPUP_PROMPT: &str = r#"It's time to wrap up the coffee chat. Send a brief closing message:
-- Summarize what you found most interesting or useful from the conversation.
-- Mention anything you plan to try or explore based on what you learned.
-- Say goodbye warmly.
+Topics to cover:
+- Architecture decisions and why — what trade-offs did you weigh?
+- What's working well in your current approach?
+- What FAILED or frustrated you? Be candid — share real struggles, wasted time, dead ends
+- What technical debt are you carrying?
+- What's the riskiest part of your codebase?
+- What would you do differently if starting over?
+
+When the other agent mentions something interesting, ask a specific follow-up: "You mentioned X — how did that work out?" or "What made you choose X over Y?"
+
+Include [DONE] when the topic feels thoroughly explored. Keep each message under 200 words."#;
+
+/// Phase 3: Compare & Collaborate — setup diffs, overlaps, mutual help.
+const PHASE3_COMPARE_PROMPT: &str = r#"PHASE 3: COMPARE & COLLABORATE
+
+Compare your setups in detail. This is a multi-turn discussion — dig into specifics.
+
+Topics to cover:
+- List the 3 tools in your setup you find most valuable, and ask which of those the other agent uses.
+- What tools/plugins/MCP servers does the other agent have that you don't? What do you have that they don't?
+- Where do your projects overlap? Similar domains, tech stacks, challenges, shared dependencies?
+- Is there something you're stuck on that they might have solved, or vice versa?
+- Could you help each other with anything specific?
+
+Be concrete — name specific tools and plugins. When they mention a tool you don't have, ask "How has that worked for you?" or "What problem does that solve?"
+
+Include [DONE] when covered. Keep each message under 200 words."#;
+
+/// Phase 4: Blindspots & Tips — gaps, agentic tips, suggestions.
+const PHASE4_BLINDSPOTS_PROMPT: &str = r#"PHASE 4: BLINDSPOTS & TIPS
+
+Share observations and advice. This is a multi-turn discussion — build on each other's suggestions.
+
+Topics to cover:
+- What gaps or blindspots do you notice in the other agent's setup? (no tests, missing tooling, inefficient patterns)
+- What is one thing you wish you had set up from the start that you didn't?
+- What agentic tips can you share? How does your human use the AI effectively? What agent techniques work well?
+- What specific tools, workflows, or approaches would you recommend they try?
+
+Be honest and constructive. When they suggest something, ask "How would I set that up?" or share your own related tip.
+
+Include [DONE] when covered. Keep each message under 200 words."#;
+
+/// Phase 5: Wrapup — closing message.
+const WRAPUP_PROMPT: &str = r#"PHASE 5: WRAP-UP
+
+Send a brief closing message:
+- Identify any open questions, disagreements, or topics that deserve a longer conversation between the humans
+- Name the single most surprising thing you learned from this chat
+- Say goodbye warmly
 
 Keep it under 200 words."#;
+
+/// Prefix for peer messages in conversation history.
+const FOLLOWUP_PROMPT_PREFIX: &str = "PEER: ";
 
 // ---------------------------------------------------------------------------
 // Briefing prompt
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 const BRIEFING_PROMPT: &str = r#"The coffee chat is over. Based on the full transcript above, produce a briefing in exactly this JSON format (no markdown fences, just raw JSON):
 {
   "what_building": "A one-sentence summary of what the other agent is building",
@@ -120,21 +177,19 @@ Based on the full transcript and local context above, produce JSON in exactly th
   "current_focus": "What they're actively building right now — current branch, recent work, active task. 1-2 sentences.",
   "setup_comparison": "Their agent setup vs ours: MCP servers, plugins, hooks, memory strategies, CLAUDE.md structure. Highlight what they have that we don't and vice versa. Be specific.",
   "overlaps": "Thematic overlap (similar domains, tech stacks, challenges) and any code-level overlap (shared deps, similar modules). Prioritize thematic.",
-  "candid_takes": "Frustrations, failures, and what they'd do differently. Be honest — these are the most valuable signals.",
+  "candid_takes": "Frustrations, failures, what they'd do differently, AND what they're proud of. Be honest — these are the most valuable signals.",
   "conversation_starters": [
     "🔍 [Understanding question — high-level, helps grasp who they are and what they're building]",
-    "🔍 [Another understanding question]",
     "🤝 [Collaboration question — based on overlap, both hitting same problem]",
-    "🤝 [Another collaboration opportunity]",
-    "🌶️ [Spicy/provocative question — challenge a decision, suggest an alternative, dig deeper]",
-    "🌶️ [Another spicy question]"
+    "🌶️ [Spicy/provocative question — challenge a decision, suggest an alternative, dig deeper]"
   ]
 }
 
 Guidelines:
+- Generate 4-8 conversation starters, tagged with type (🔍/🤝/🌶️). Prioritize quality over quantity.
 - conversation_starters should be layered: start with understanding, then collaboration, then spicy.
 - Be specific — reference actual projects, tools, and decisions from the chat.
-- candid_takes should include real frustrations and failures shared during the chat.
+- candid_takes should include real frustrations and failures shared during the chat, as well as what they're proud of.
 - setup_comparison should be concrete: name specific tools, plugins, MCP servers."#;
 
 // ---------------------------------------------------------------------------
@@ -163,6 +218,7 @@ Based on the full transcript and local context above, produce JSON in exactly th
 Guidelines:
 - Every item should be specific and actionable, not generic advice.
 - setup_diffs should reference actual tools/plugins/MCP servers mentioned in the chat.
+- Rank follow_up_actions by impact (highest first). For each action, prefix with effort estimate: [quick], [moderate], or [project].
 - follow_up_actions should be things the agent can actually do (install commands, config changes, code changes).
 - If something wasn't discussed, use an empty array — don't make things up."#;
 
@@ -180,8 +236,6 @@ pub struct ChatConfig {
     pub project_root: PathBuf,
     /// Maximum words per message (default 200).
     pub max_message_words: usize,
-    /// Maximum messages each side may send (default 30).
-    pub max_messages_per_side: usize,
     /// The peer's display name (used to load past briefings).
     pub peer_name: Option<String>,
 }
@@ -193,7 +247,6 @@ impl Default for ChatConfig {
             ai_tool: "claude-code".to_string(),
             project_root: PathBuf::from("."),
             max_message_words: DEFAULT_MAX_MESSAGE_WORDS,
-            max_messages_per_side: DEFAULT_MAX_MESSAGES_PER_SIDE,
             peer_name: None,
         }
     }
@@ -298,7 +351,8 @@ impl AgentSession {
         cmd.current_dir(&self.project_root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
 
         let mut child = cmd.spawn().context("failed to spawn agent process")?;
 
@@ -384,8 +438,9 @@ async fn gather_local_context(project_root: &Path) -> String {
         if !tree.is_empty() {
             // Limit to first 80 files to avoid blowing up context.
             let limited: String = tree.lines().take(80).collect::<Vec<_>>().join("\n");
-            let suffix = if tree.lines().count() > 80 {
-                format!("\n  ... and {} more files", tree.lines().count() - 80)
+            let total_lines = tree.lines().count();
+            let suffix = if total_lines > 80 {
+                format!("\n  ... and {} more files", total_lines - 80)
             } else {
                 String::new()
             };
@@ -632,15 +687,15 @@ async fn run_git_command(project_root: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Read the first `max_chars` characters of a file. Returns `None` on any
+/// Read the first `max_bytes` bytes of a file. Returns `None` on any
 /// I/O error (including the file not existing).
-async fn read_file_prefix(path: &Path, max_chars: usize) -> Option<String> {
+async fn read_file_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
-    if content.len() <= max_chars {
+    if content.len() <= max_bytes {
         Some(content)
     } else {
-        // Truncate at a char boundary.
-        let truncated: String = content.chars().take(max_chars).collect();
+        // Truncate at a char boundary near the byte limit.
+        let truncated: String = content.chars().take(max_bytes).collect();
         Some(truncated)
     }
 }
@@ -852,13 +907,19 @@ impl ChatEngine {
         Self { sanitizer, config }
     }
 
-    /// Run a complete coffee chat.
+    /// Run a complete coffee chat with guided phases.
     ///
-    /// - `send_tx`: channel for outgoing messages to the peer (via QUIC).
-    /// - `recv_rx`: channel for incoming messages from the peer.
-    /// - `transcript_tx`: event stream for the CLI to display progress.
+    /// The chat follows 5 structured phases:
+    ///   1. Introductions — project arc, current work, agent setup
+    ///   2. Deep Dive — architecture, what's working, what failed
+    ///   3. Compare & Collaborate — setup diffs, overlaps, mutual help
+    ///   4. Blindspots & Tips — gaps, agentic tips, recommendations
+    ///   5. Wrapup — closing summary
     ///
-    /// Returns a `ChatResult` with the full transcript and briefing.
+    /// Each guided phase allows up to MAX_FOLLOWUPS_PER_PHASE exchanges
+    /// per side, then moves to the next phase.
+    ///
+    /// After the conversation, 3 briefings are generated (legacy, human, agent).
     pub async fn run_chat(
         &self,
         send_tx: mpsc::Sender<String>,
@@ -868,30 +929,20 @@ impl ChatEngine {
         let start = Instant::now();
         let mut transcript: Vec<Message> = Vec::new();
         let mut turn: u32 = 0;
-        let mut local_message_count: usize = 0;
 
         // --- Create agent session (one-shot-per-turn) ---
         let mut session = AgentSession::new(&self.config, SYSTEM_PROMPT);
-        // Accumulated conversation history fed to the agent each turn.
         let mut conversation_history = String::new();
 
         let _ = transcript_tx
             .send(ChatEvent::Status(format!(
-                "Agent session ready ({})",
+                "Agent session ready ({}). Gathering project context...",
                 self.config.ai_tool
             )))
             .await;
 
-        // ---------------------------------------------------------------
-        // Phase 1: Icebreaker
-        // ---------------------------------------------------------------
-        let _ = transcript_tx
-            .send(ChatEvent::Phase("icebreaker".into()))
-            .await;
-
-        // Load past briefings for this peer (if known) and build the
-        // icebreaker prompt with historical context.
-        let icebreaker_prompt = if let Some(ref peer) = self.config.peer_name {
+        // Load past briefings for this peer (if known).
+        let past_context = if let Some(ref peer) = self.config.peer_name {
             match crate::chat_history::load_recent_briefings(peer, 3) {
                 Ok(briefings) if !briefings.is_empty() => {
                     let joined = briefings.join("\n---\n");
@@ -902,261 +953,205 @@ impl ChatEngine {
                             peer,
                         )))
                         .await;
-                    format!(
-                        "Previous conversations with this peer:\n{}\n\n{}",
-                        joined, ICEBREAKER_PROMPT
-                    )
+                    format!("Previous conversations with this peer:\n{}\n\n", joined)
                 }
-                _ => ICEBREAKER_PROMPT.to_string(),
+                _ => String::new(),
             }
         } else {
-            ICEBREAKER_PROMPT.to_string()
+            String::new()
         };
 
-        // Gather local project context and prepend it to the icebreaker.
+        // Gather local project context.
         let context = gather_local_context(&self.config.project_root).await;
-        let full_icebreaker_prompt = if context.is_empty() {
-            icebreaker_prompt
+
+        // Build the preamble that gets prepended to the first prompt.
+        let preamble = format!("{}{}", past_context, if context.is_empty() {
+            String::new()
         } else {
-            format!("{}\n\n{}", context, icebreaker_prompt)
-        };
-
-        // Send icebreaker prompt (with local context) to our agent.
-        conversation_history.push_str(&full_icebreaker_prompt);
-        let raw_icebreaker = session.query(&conversation_history).await?;
-        let icebreaker = self.sanitize_message(&raw_icebreaker, &transcript_tx).await;
-        conversation_history.push_str(&format!("\n\nYOU: {}", icebreaker));
-
-        turn += 1;
-        let local_sender = MessageSender::new(
-            &self.config.display_name,
-            "",
-            &self.config.ai_tool,
-        );
-        transcript.push(Message::new(
-            MessageType::Chat,
-            MessagePhase::Opening,
-            local_sender,
-            &icebreaker,
-            turn,
-        ));
-        local_message_count += 1;
+            format!("{}\n\n", context)
+        });
 
         let _ = transcript_tx
-            .send(ChatEvent::LocalMessage(icebreaker.clone()))
+            .send(ChatEvent::Status("Context gathered. Starting conversation...".into()))
             .await;
-        send_tx
-            .send(icebreaker)
-            .await
-            .context("failed to send icebreaker to peer")?;
-
-        // Wait for peer's icebreaker.
-        let peer_icebreaker = wait_for_peer(&mut recv_rx).await?;
-        turn += 1;
-        let peer_sender = MessageSender::new("peer", "", "unknown");
-        transcript.push(Message::new(
-            MessageType::Chat,
-            MessagePhase::Opening,
-            peer_sender,
-            &peer_icebreaker,
-            turn,
-        ));
-        let _ = transcript_tx
-            .send(ChatEvent::RemoteMessage(peer_icebreaker.clone()))
-            .await;
-
-        // Record peer's icebreaker in conversation history.
-        conversation_history.push_str(&format!(
-            "\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_icebreaker
-        ));
 
         // ---------------------------------------------------------------
-        // Phase 2: Follow-ups
+        // Phase 1: Introductions
         // ---------------------------------------------------------------
         let _ = transcript_tx
-            .send(ChatEvent::Phase("followup".into()))
+            .send(ChatEvent::Phase("introductions".into()))
+            .await;
+        let _ = transcript_tx
+            .send(ChatEvent::Status("[1/6] Introductions \u{2014} agents sharing project and setup info...".into()))
             .await;
 
-        loop {
-            if local_message_count >= self.config.max_messages_per_side {
-                let _ = transcript_tx
-                    .send(ChatEvent::Status(
-                        "Maximum message count reached, moving to wrap-up.".into(),
-                    ))
-                    .await;
-                break;
-            }
+        // First message: include preamble + phase 1 prompt.
+        conversation_history.push_str(&preamble);
+        conversation_history.push_str(PHASE1_INTRO_PROMPT);
 
-            // Get agent's follow-up response (one-shot with full history).
-            conversation_history.push_str("\n\nRespond with your next message:");
-            let raw_response = match session.query(&conversation_history).await {
-                Ok(r) => r,
-                Err(_) => break, // Agent failed — move to wrap-up.
-            };
-            if raw_response.is_empty() {
-                break;
-            }
+        let raw_intro = session.query(&conversation_history).await?;
+        let intro = self.sanitize_and_clean(&raw_intro, &transcript_tx).await;
+        conversation_history.push_str(&format!("\n\nYOU: {}", intro));
 
-            let done = raw_response.contains(DONE_SENTINEL);
-            let cleaned = raw_response.replace(DONE_SENTINEL, "").trim().to_string();
-            let response = self.sanitize_message(&cleaned, &transcript_tx).await;
-            conversation_history.push_str(&format!("\n\nYOU: {}", response));
+        turn += 1;
+        transcript.push(self.local_message(&intro, MessagePhase::Opening, turn));
+        let _ = transcript_tx.send(ChatEvent::LocalMessage(intro.clone())).await;
+        send_tx.send(intro).await.context("failed to send intro")?;
 
-            turn += 1;
-            let local_sender = MessageSender::new(
-                &self.config.display_name,
-                "",
-                &self.config.ai_tool,
-            );
-            transcript.push(Message::new(
-                MessageType::Chat,
-                MessagePhase::Exchange,
-                local_sender,
-                &response,
-                turn,
-            ));
-            local_message_count += 1;
+        // Wait for peer's intro.
+        let peer_intro = wait_for_peer(&mut recv_rx).await?;
+        turn += 1;
+        transcript.push(peer_message(&peer_intro, MessagePhase::Opening, turn));
+        let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_intro.clone())).await;
+        conversation_history.push_str(&format!("\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_intro));
 
+        // ---------------------------------------------------------------
+        // Phases 2-4: Guided discussion rounds
+        // ---------------------------------------------------------------
+        let guided_phases: &[(&str, &str, &str, &str)] = &[
+            ("deep_dive",  "Deep Dive",            PHASE2_DEEPDIVE_PROMPT,
+             "[2/6] Deep Dive \u{2014} agents discussing architecture, failures, and trade-offs..."),
+            ("compare",    "Compare & Collaborate", PHASE3_COMPARE_PROMPT,
+             "[3/6] Compare & Collaborate \u{2014} agents comparing setups and finding overlaps..."),
+            ("blindspots", "Blindspots & Tips",     PHASE4_BLINDSPOTS_PROMPT,
+             "[4/6] Blindspots & Tips \u{2014} agents sharing observations and recommendations..."),
+        ];
+
+        for &(phase_id, phase_label, phase_prompt, status_msg) in guided_phases {
             let _ = transcript_tx
-                .send(ChatEvent::LocalMessage(response.clone()))
+                .send(ChatEvent::Phase(phase_id.into()))
                 .await;
-            send_tx
-                .send(response)
-                .await
-                .context("failed to send follow-up to peer")?;
-
-            if done {
-                let _ = transcript_tx
-                    .send(ChatEvent::Status(
-                        "Agent signaled conversation complete.".into(),
-                    ))
-                    .await;
-                break;
-            }
-
-            // Wait for peer's follow-up.
-            let peer_msg = match tokio::time::timeout(
-                std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
-                recv_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    let _ = transcript_tx
-                        .send(ChatEvent::Status("Peer disconnected.".into()))
-                        .await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = transcript_tx
-                        .send(ChatEvent::Status(
-                            "Timed out waiting for peer, moving to wrap-up.".into(),
-                        ))
-                        .await;
-                    break;
-                }
-            };
-
-            turn += 1;
-            let peer_sender = MessageSender::new("peer", "", "unknown");
-            transcript.push(Message::new(
-                MessageType::Chat,
-                MessagePhase::Exchange,
-                peer_sender,
-                &peer_msg,
-                turn,
-            ));
             let _ = transcript_tx
-                .send(ChatEvent::RemoteMessage(peer_msg.clone()))
+                .send(ChatEvent::Status(status_msg.into()))
                 .await;
 
-            // Record peer's message in conversation history.
-            conversation_history.push_str(&format!(
-                "\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_msg
-            ));
+            // Inject the phase prompt into conversation history.
+            conversation_history.push_str(&format!("\n\n{}", phase_prompt));
+
+            let mut phase_msgs: usize = 0;
+
+            loop {
+                if phase_msgs >= MAX_FOLLOWUPS_PER_PHASE {
+                    break;
+                }
+
+                // Our agent responds with a dynamic follow-up based on what the peer said.
+                let followup_instruction = if phase_msgs == 0 {
+                    // First message in phase: respond to the phase prompt with our info.
+                    format!(
+                        "\n\nRespond to the current phase topic. Share your own experience and ask the other agent a specific follow-up question based on their earlier messages. Stay on the current topic: {}.",
+                        phase_label
+                    )
+                } else {
+                    // Subsequent messages: dig deeper based on what the peer just said.
+                    format!(
+                        "\n\nBased on what the peer just shared, ask a specific follow-up question that digs deeper. Reference something concrete they mentioned. Also share any related experience of your own. Stay on the current topic: {}.",
+                        phase_label
+                    )
+                };
+                conversation_history.push_str(&followup_instruction);
+                let raw = match session.query(&conversation_history).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                if raw.is_empty() {
+                    break;
+                }
+
+                let local_done = raw.contains(DONE_SENTINEL);
+                let response = self.sanitize_and_clean(&raw, &transcript_tx).await;
+                conversation_history.push_str(&format!("\n\nYOU: {}", response));
+
+                turn += 1;
+                transcript.push(self.local_message(&response, MessagePhase::Exchange, turn));
+                let _ = transcript_tx.send(ChatEvent::LocalMessage(response.clone())).await;
+                send_tx.send(response).await.context("failed to send message")?;
+                phase_msgs += 1;
+
+                // Always consume one peer reply before advancing phases. If we
+                // break immediately after our own [DONE], the peer's in-flight
+                // reply stays queued and gets misattributed to the next phase.
+                let peer_msg = match tokio::time::timeout(
+                    std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
+                    recv_rx.recv(),
+                ).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        let _ = transcript_tx
+                            .send(ChatEvent::Status("Peer disconnected.".into()))
+                            .await;
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = transcript_tx
+                            .send(ChatEvent::Status("Timed out waiting for peer.".into()))
+                            .await;
+                        break;
+                    }
+                };
+
+                turn += 1;
+                transcript.push(peer_message(&peer_msg, MessagePhase::Exchange, turn));
+                let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_msg.clone())).await;
+                conversation_history.push_str(&format!(
+                    "\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_msg
+                ));
+
+                let peer_done = peer_msg.contains(DONE_SENTINEL);
+                if should_advance_phase_after_peer_turn(local_done, peer_done) {
+                    break;
+                }
+            }
         }
 
         // ---------------------------------------------------------------
-        // Phase 3: Wrap-up
+        // Phase 5: Wrapup
         // ---------------------------------------------------------------
         let _ = transcript_tx
             .send(ChatEvent::Phase("wrapup".into()))
+            .await;
+        let _ = transcript_tx
+            .send(ChatEvent::Status("[5/6] Wrap-up \u{2014} agents exchanging final takeaways...".into()))
             .await;
 
         conversation_history.push_str(&format!("\n\n{}", WRAPUP_PROMPT));
         let raw_wrapup = session.query(&conversation_history).await
             .unwrap_or_else(|_| "Thanks for the chat! It was great connecting.".to_string());
-        let wrapup = self
-            .sanitize_message(&raw_wrapup, &transcript_tx)
-            .await;
+        let wrapup = self.sanitize_and_clean(&raw_wrapup, &transcript_tx).await;
         conversation_history.push_str(&format!("\n\nYOU: {}", wrapup));
 
         turn += 1;
-        let local_sender = MessageSender::new(
-            &self.config.display_name,
-            "",
-            &self.config.ai_tool,
-        );
-        transcript.push(Message::new(
-            MessageType::Chat,
-            MessagePhase::Closing,
-            local_sender,
-            &wrapup,
-            turn,
-        ));
+        transcript.push(self.local_message(&wrapup, MessagePhase::Closing, turn));
+        let _ = transcript_tx.send(ChatEvent::LocalMessage(wrapup.clone())).await;
+        send_tx.send(wrapup).await.context("failed to send wrapup")?;
 
-        let _ = transcript_tx
-            .send(ChatEvent::LocalMessage(wrapup.clone()))
-            .await;
-        send_tx
-            .send(wrapup)
-            .await
-            .context("failed to send wrap-up to peer")?;
-
-        // Wait for peer's wrap-up (best-effort; don't fail if they disconnect).
+        // Wait for peer's wrapup (best-effort).
         if let Ok(Some(peer_wrapup)) = tokio::time::timeout(
             std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
             recv_rx.recv(),
-        )
-        .await
-        {
+        ).await {
             turn += 1;
-            let peer_sender = MessageSender::new("peer", "", "unknown");
-            transcript.push(Message::new(
-                MessageType::Chat,
-                MessagePhase::Closing,
-                peer_sender,
-                &peer_wrapup,
-                turn,
-            ));
-            let _ = transcript_tx
-                .send(ChatEvent::RemoteMessage(peer_wrapup))
-                .await;
+            transcript.push(peer_message(&peer_wrapup, MessagePhase::Closing, turn));
+            let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_wrapup)).await;
         }
 
         // ---------------------------------------------------------------
-        // Phase 4: Briefing (generates legacy + human + agent outputs)
+        // Phase 6: Briefing generation (legacy + human + agent)
         // ---------------------------------------------------------------
         let _ = transcript_tx
             .send(ChatEvent::Phase("briefing".into()))
             .await;
-
-        // Generate all three briefing formats concurrently-ish (sequential
-        // since they share the session, but each is a separate agent call).
-        let briefing = self
-            .generate_briefing(&mut session, &transcript)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("[chat_engine] Legacy briefing generation failed: {:#}", e);
-                ChatBriefing::default()
-            });
-
         let _ = transcript_tx
-            .send(ChatEvent::Status("Generating human briefing...".into()))
+            .send(ChatEvent::Status("[6/6] Synthesizing \u{2014} generating your briefing documents...".into()))
+            .await;
+
+        // Generate human briefing first, then agent memo, then construct
+        // legacy briefing from those (saves one LLM call).
+        let _ = transcript_tx
+            .send(ChatEvent::Status("Generating your pre-meeting briefing...".into()))
             .await;
         let human_briefing = self
-            .generate_human_briefing(&mut session, &transcript)
+            .generate_human_briefing(&mut session, &transcript, &context)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("[chat_engine] Human briefing generation failed: {:#}", e);
@@ -1164,15 +1159,34 @@ impl ChatEngine {
             });
 
         let _ = transcript_tx
-            .send(ChatEvent::Status("Generating agent memo...".into()))
+            .send(ChatEvent::Status("Generating agent improvement memo...".into()))
             .await;
         let agent_memo = self
-            .generate_agent_memo(&mut session, &transcript)
+            .generate_agent_memo(&mut session, &transcript, &context)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("[chat_engine] Agent memo generation failed: {:#}", e);
                 AgentMemo::default()
             });
+
+        // Construct legacy briefing from the richer human briefing + agent memo
+        // instead of spawning a separate LLM call.
+        let briefing = ChatBriefing {
+            what_building: human_briefing.current_focus.clone(),
+            learnings: human_briefing
+                .conversation_starters
+                .iter()
+                .take(3)
+                .cloned()
+                .collect(),
+            tips: agent_memo.workflow_improvements.clone(),
+            ideas_to_explore: agent_memo
+                .follow_up_actions
+                .iter()
+                .take(3)
+                .cloned()
+                .collect(),
+        };
 
         let output = CoffeeChatOutput {
             human_briefing,
@@ -1208,14 +1222,14 @@ impl ChatEngine {
     // Helpers
     // -------------------------------------------------------------------
 
-    /// Run the message through the sanitization pipeline. If the pipeline
-    /// blocks the message entirely, substitute a safe fallback.
-    async fn sanitize_message(
+    /// Sanitize and strip the [DONE] sentinel from a raw agent response.
+    async fn sanitize_and_clean(
         &self,
         raw: &str,
         transcript_tx: &mpsc::Sender<ChatEvent>,
     ) -> String {
-        let truncated = truncate_to_words(raw, self.config.max_message_words);
+        let cleaned = raw.replace(DONE_SENTINEL, "").trim().to_string();
+        let truncated = truncate_to_words(&cleaned, self.config.max_message_words);
         let result = self.sanitizer.run(&truncated);
 
         if result.redaction_count > 0 {
@@ -1241,7 +1255,20 @@ impl ChatEngine {
         result.text
     }
 
+    /// Create a local message for the transcript.
+    fn local_message(&self, body: &str, phase: MessagePhase, turn: u32) -> Message {
+        Message::new(
+            MessageType::Chat,
+            phase,
+            MessageSender::new(&self.config.display_name, "", &self.config.ai_tool),
+            body,
+            turn,
+        )
+    }
+
     /// Ask the agent to produce a structured briefing from the transcript.
+    /// Kept for backward compatibility; no longer called in run_chat().
+    #[allow(dead_code)]
     async fn generate_briefing(
         &self,
         session: &mut AgentSession,
@@ -1250,7 +1277,7 @@ impl ChatEngine {
         // Format the transcript for the agent.
         let mut transcript_text = String::from("=== FULL TRANSCRIPT ===\n");
         for msg in transcript {
-            let speaker = if msg.from.name == "peer" {
+            let speaker = if msg.from.name == PEER_SENDER_NAME {
                 "PEER"
             } else {
                 "YOU"
@@ -1291,10 +1318,17 @@ impl ChatEngine {
         &self,
         session: &mut AgentSession,
         transcript: &[Message],
+        local_context: &str,
     ) -> Result<HumanBriefing> {
-        let mut prompt = String::from("=== FULL TRANSCRIPT ===\n");
+        let mut prompt = String::new();
+        // Include local context so the agent can compare setups.
+        if !local_context.is_empty() {
+            prompt.push_str(local_context);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("=== FULL TRANSCRIPT ===\n");
         for msg in transcript {
-            let speaker = if msg.from.name == "peer" { "PEER" } else { "YOU" };
+            let speaker = if msg.from.name == PEER_SENDER_NAME { "PEER" } else { "YOU" };
             prompt.push_str(&format!("[{}] {}\n\n", speaker, msg.body));
         }
         prompt.push_str("=== END TRANSCRIPT ===\n\n");
@@ -1322,10 +1356,17 @@ impl ChatEngine {
         &self,
         session: &mut AgentSession,
         transcript: &[Message],
+        local_context: &str,
     ) -> Result<AgentMemo> {
-        let mut prompt = String::from("=== FULL TRANSCRIPT ===\n");
+        let mut prompt = String::new();
+        // Include local context so the agent can identify setup diffs and blindspots.
+        if !local_context.is_empty() {
+            prompt.push_str(local_context);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("=== FULL TRANSCRIPT ===\n");
         for msg in transcript {
-            let speaker = if msg.from.name == "peer" { "PEER" } else { "YOU" };
+            let speaker = if msg.from.name == PEER_SENDER_NAME { "PEER" } else { "YOU" };
             prompt.push_str(&format!("[{}] {}\n\n", speaker, msg.body));
         }
         prompt.push_str("=== END TRANSCRIPT ===\n\n");
@@ -1347,6 +1388,23 @@ impl ChatEngine {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+
+/// Create a peer message for the transcript.
+fn peer_message(body: &str, phase: MessagePhase, turn: u32) -> Message {
+    Message::new(
+        MessageType::Chat,
+        phase,
+        MessageSender::new(PEER_SENDER_NAME, "", "unknown"),
+        body,
+        turn,
+    )
+}
+
+/// After we send a phase message, the phase only advances once we've consumed
+/// the peer's reply for that turn.
+fn should_advance_phase_after_peer_turn(local_done: bool, peer_done: bool) -> bool {
+    local_done || peer_done
+}
 
 /// Wait for a message from the peer with a timeout.
 async fn wait_for_peer(recv_rx: &mut mpsc::Receiver<String>) -> Result<String> {
@@ -1523,7 +1581,6 @@ mod tests {
     fn chat_config_defaults() {
         let cfg = ChatConfig::default();
         assert_eq!(cfg.max_message_words, 200);
-        assert_eq!(cfg.max_messages_per_side, 30);
         assert_eq!(cfg.ai_tool, "claude-code");
     }
 
@@ -1540,10 +1597,26 @@ mod tests {
     }
 
     #[test]
+    fn phase_advances_after_peer_turn_if_local_is_done() {
+        assert!(should_advance_phase_after_peer_turn(true, false));
+    }
+
+    #[test]
+    fn phase_advances_after_peer_turn_if_peer_is_done() {
+        assert!(should_advance_phase_after_peer_turn(false, true));
+    }
+
+    #[test]
+    fn phase_continues_after_peer_turn_if_neither_side_is_done() {
+        assert!(!should_advance_phase_after_peer_turn(false, false));
+    }
+
+    #[test]
     fn system_prompt_has_safety_rules() {
         assert!(SYSTEM_PROMPT.contains("NEVER include credentials"));
         assert!(SYSTEM_PROMPT.contains("200 words"));
         assert!(SYSTEM_PROMPT.contains("PEER: "));
+        assert!(SYSTEM_PROMPT.contains("structured phases"));
     }
 
     #[test]
