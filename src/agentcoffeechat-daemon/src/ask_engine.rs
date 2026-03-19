@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use agentcoffeechat_core::SanitizationPipeline;
 
 /// Timeout for the ask-engine agent subprocess (seconds).
-const ASK_AGENT_TIMEOUT_SECS: u64 = 30;
+const ASK_AGENT_TIMEOUT_SECS: u64 = 45;
 
 // ---------------------------------------------------------------------------
 // System prompt for instant questions
@@ -195,7 +195,7 @@ pub async fn run_prompt(
         child.wait_with_output(),
     )
     .await
-    .context("agent timed out (30s limit for instant questions)")?
+    .context("agent timed out (45s limit for instant questions)")?
     .context("failed to read agent output")?;
 
     if !output.status.success() {

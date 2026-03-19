@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// ALPN protocol identifier for AgentCoffeeChat.
 const ALPN_PROTOCOL: &[u8] = b"agentcoffeechat/1.0";
 
-/// Maximum allowed message size (5 KB).
-const MAX_MESSAGE_SIZE: u32 = 5 * 1024;
+/// Maximum allowed message size (64 KB).
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024;
 
 /// Length-prefix size in bytes (u32 big-endian).
 const LENGTH_PREFIX_SIZE: usize = 4;
@@ -31,7 +31,6 @@ pub enum WireMessage {
     ChatOpen {
         peer_name: String,
         fingerprint_prefix: String,
-        proof_code: String,
     },
     Chat {
         text: String,
@@ -39,7 +38,6 @@ pub enum WireMessage {
     AskRequest {
         peer_name: String,
         fingerprint_prefix: String,
-        proof_code: String,
         question: String,
     },
     AskResponse {
@@ -81,10 +79,21 @@ impl TransportService {
             .context("failed to build server TLS config")?;
         server_crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        // -- Transport config: prevent idle timeout during long agent operations --
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(
+            std::time::Duration::from_secs(90).try_into().expect("valid idle timeout")
+        ));
+        transport_config.keep_alive_interval(Some(
+            std::time::Duration::from_secs(15)
+        ));
+        let transport_config = Arc::new(transport_config);
+
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(server_crypto)
                 .context("failed to create QUIC server config")?,
         ));
+        server_config.transport_config(transport_config.clone());
 
         // -- Client TLS config (skip server verification for now) --
         // SECURITY NOTE: TLS certificate verification is intentionally skipped.
@@ -102,10 +111,11 @@ impl TransportService {
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
-        let client_config = quinn::ClientConfig::new(Arc::new(
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(client_crypto)
                 .context("failed to create QUIC client config")?,
         ));
+        client_config.transport_config(transport_config);
 
         // -- Build endpoint (both client and server) --
         let bind_addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -350,11 +360,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[test]
-    fn ask_request_wire_message_roundtrip_preserves_proof_code() {
+    fn ask_request_wire_message_roundtrip() {
         let msg = WireMessage::AskRequest {
             peer_name: "alice-fp123456".to_string(),
             fingerprint_prefix: "fp1234567890abcd".to_string(),
-            proof_code: "river-moon-bright".to_string(),
             question: "How does auth work?".to_string(),
         };
 
@@ -364,11 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn chat_open_wire_message_roundtrip_preserves_proof_code() {
+    fn chat_open_wire_message_roundtrip() {
         let msg = WireMessage::ChatOpen {
             peer_name: "bob-abcd1234".to_string(),
             fingerprint_prefix: "abcd1234efef5678".to_string(),
-            proof_code: "tiger-castle-seven".to_string(),
         };
 
         let json = serde_json::to_string(&msg).expect("serialize chat open");
@@ -434,7 +442,7 @@ mod tests {
         server_handle.await.expect("server task panicked");
     }
 
-    /// Verify that the framing layer rejects messages larger than 5 KB.
+    /// Verify that the framing layer rejects messages larger than 64 KB.
     #[tokio::test]
     async fn message_too_large_is_rejected() {
         let (server, client, server_addr) = setup();
@@ -468,8 +476,8 @@ mod tests {
             .expect("connect failed");
         let (mut send, _recv) = conn.open_stream().await.expect("open_stream failed");
 
-        // Write a length prefix claiming 10 KB, but don't bother sending payload.
-        let fake_len: u32 = 10 * 1024;
+        // Write a length prefix claiming 128 KB, but don't bother sending payload.
+        let fake_len: u32 = 128 * 1024;
         send.write_all(&fake_len.to_be_bytes())
             .await
             .expect("write length prefix");
@@ -519,7 +527,7 @@ mod tests {
         server_handle.await.expect("server task panicked");
     }
 
-    /// Verify that exactly 5 KB (the limit) is accepted.
+    /// Verify that exactly 64 KB (the limit) is accepted.
     #[tokio::test]
     async fn message_at_max_size_is_accepted() {
         let (server, client, server_addr) = setup();

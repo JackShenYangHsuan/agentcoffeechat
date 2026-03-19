@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use agentcoffeechat_core::{socket_path, DaemonCommand, DaemonResponse};
 use agentcoffeechat_daemon::ask_engine::AskEngine;
-use agentcoffeechat_daemon::auth::{validate_inbound_session, validate_outbound_session};
+// auth validation functions removed — session existence + expiry check is sufficient
 use agentcoffeechat_daemon::awdl::{self, AwdlActivator};
 use agentcoffeechat_daemon::chat_engine;
 use agentcoffeechat_daemon::chat_history;
@@ -317,7 +317,6 @@ async fn handle_command(
                 let peers = state.peers.lock().await;
                 peers.iter().find(|p| p.name == peer_name).cloned()
             };
-            let peer_fp = peer_info.as_ref().map(|p| p.fingerprint_prefix.clone());
 
             let (peer_addr, peer_port) = match peer_info {
                 Some(p) => match p.address {
@@ -341,18 +340,6 @@ async fn handle_command(
                 Some(t) => t,
                 None => {
                     return DaemonResponse::error("QUIC transport is not running".to_string());
-                }
-            };
-
-            let proof_code = {
-                let mgr = state.session_mgr.lock().await;
-                match validate_outbound_session(
-                    mgr.get_session(&peer_name),
-                    &peer_name,
-                    peer_fp.as_deref(),
-                ) {
-                    Ok(code) => code.to_string(),
-                    Err(message) => return DaemonResponse::error(message),
                 }
             };
 
@@ -381,7 +368,6 @@ async fn handle_command(
             let request = WireMessage::AskRequest {
                 peer_name: config.peer_label(),
                 fingerprint_prefix: config.fingerprint_prefix.clone(),
-                proof_code,
                 question,
             };
 
@@ -428,7 +414,6 @@ async fn handle_command(
                 let peers = state.peers.lock().await;
                 peers.iter().find(|p| p.name == peer_name).cloned()
             };
-            let peer_fp = peer_info.as_ref().map(|p| p.fingerprint_prefix.clone());
 
             let (peer_addr, peer_port) = match peer_info {
                 Some(p) => match p.address {
@@ -464,18 +449,6 @@ async fn handle_command(
                 Some(t) => t,
                 None => {
                     return DaemonResponse::error("QUIC transport is not running".to_string());
-                }
-            };
-
-            let proof_code = {
-                let mgr = state.session_mgr.lock().await;
-                match validate_outbound_session(
-                    mgr.get_session(&peer_name),
-                    &peer_name,
-                    peer_fp.as_deref(),
-                ) {
-                    Ok(code) => code.to_string(),
-                    Err(message) => return DaemonResponse::error(message),
                 }
             };
 
@@ -519,7 +492,6 @@ async fn handle_command(
                 &WireMessage::ChatOpen {
                     peer_name: config.peer_label(),
                     fingerprint_prefix: config.fingerprint_prefix.clone(),
-                    proof_code,
                 },
             )
             .await
@@ -1253,13 +1225,23 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let first_message = match transport::recv_wire_message(&mut quic_recv).await {
-                    Ok(msg) => msg,
-                    Err(e) => {
+                let first_message = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    transport::recv_wire_message(&mut quic_recv),
+                ).await {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(e)) => {
                         eprintln!(
                             "[daemon] Failed to read initial wire message from {}: {:#}",
                             conn.remote_address(),
                             e
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[daemon] Timed out waiting for initial wire message from {}",
+                            conn.remote_address(),
                         );
                         continue;
                     }
@@ -1268,8 +1250,7 @@ async fn main() -> Result<()> {
                 match first_message {
                     WireMessage::AskRequest {
                         peer_name,
-                        fingerprint_prefix,
-                        proof_code,
+                        fingerprint_prefix: _,
                         question,
                     } => {
                         let ask_state = accept_state.clone();
@@ -1278,34 +1259,58 @@ async fn main() -> Result<()> {
                                 let mgr = ask_state.session_mgr.lock().await;
                                 match mgr.get_session(&peer_name) {
                                     Some(session) => {
-                                        if let Err(message) = validate_inbound_session(
-                                            Some(session),
-                                            &peer_name,
-                                            &fingerprint_prefix,
-                                            &proof_code,
-                                        ) {
-                                            WireMessage::Error { message }
+                                        if let Some(expires) = session.expires_at {
+                                            if expires < chrono::Utc::now() {
+                                                drop(mgr);
+                                                WireMessage::Error {
+                                                    message: format!(
+                                                        "session with '{}' has expired — reconnect with `acc connect {}`",
+                                                        peer_name, peer_name
+                                                    ),
+                                                }
+                                            } else {
+                                                drop(mgr);
+                                                let config = ask_state.config.lock().await.clone();
+                                                match ask_state
+                                                    .ask_engine
+                                                    .ask(
+                                                        &question,
+                                                        &peer_name,
+                                                        &config.ai_tool,
+                                                        &config.project_root,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(result) => WireMessage::AskResponse {
+                                                        answer: result.answer,
+                                                        duration_ms: result.duration_ms,
+                                                    },
+                                                    Err(e) => WireMessage::Error {
+                                                        message: e.to_string(),
+                                                    },
+                                                }
+                                            }
                                         } else {
-                                        drop(mgr);
-                                        let config = ask_state.config.lock().await.clone();
-                                        match ask_state
-                                            .ask_engine
-                                            .ask(
-                                                &question,
-                                                &peer_name,
-                                                &config.ai_tool,
-                                                &config.project_root,
-                                            )
-                                            .await
-                                        {
-                                            Ok(result) => WireMessage::AskResponse {
-                                                answer: result.answer,
-                                                duration_ms: result.duration_ms,
-                                            },
-                                            Err(e) => WireMessage::Error {
-                                                message: e.to_string(),
-                                            },
-                                        }
+                                            drop(mgr);
+                                            let config = ask_state.config.lock().await.clone();
+                                            match ask_state
+                                                .ask_engine
+                                                .ask(
+                                                    &question,
+                                                    &peer_name,
+                                                    &config.ai_tool,
+                                                    &config.project_root,
+                                                )
+                                                .await
+                                            {
+                                                Ok(result) => WireMessage::AskResponse {
+                                                    answer: result.answer,
+                                                    duration_ms: result.duration_ms,
+                                                },
+                                                Err(e) => WireMessage::Error {
+                                                    message: e.to_string(),
+                                                },
+                                            }
                                         }
                                     }
                                     None => WireMessage::Error {
@@ -1327,8 +1332,7 @@ async fn main() -> Result<()> {
                     }
                     WireMessage::ChatOpen {
                         peer_name,
-                        fingerprint_prefix,
-                        proof_code,
+                        fingerprint_prefix: _,
                     } => {
                         println!(
                             "[daemon] Incoming chat from {} ({})",
@@ -1338,13 +1342,12 @@ async fn main() -> Result<()> {
 
                         {
                             let mgr = accept_state.session_mgr.lock().await;
-                            match validate_inbound_session(
-                                mgr.get_session(&peer_name),
-                                &peer_name,
-                                &fingerprint_prefix,
-                                &proof_code,
-                            ) {
-                                Err(message) => {
+                            match mgr.get_session(&peer_name) {
+                                None => {
+                                    let message = format!(
+                                        "no active session with '{}' — connect first",
+                                        peer_name
+                                    );
                                     eprintln!(
                                         "[daemon] Incoming chat rejected from {}: {}",
                                         peer_name, message
@@ -1357,7 +1360,26 @@ async fn main() -> Result<()> {
                                     let _ = quic_send.finish();
                                     continue;
                                 }
-                                Ok(()) => {
+                                Some(session) => {
+                                    if let Some(expires) = session.expires_at {
+                                        if expires < chrono::Utc::now() {
+                                            let message = format!(
+                                                "session with '{}' has expired — reconnect with `acc connect {}`",
+                                                peer_name, peer_name
+                                            );
+                                            eprintln!(
+                                                "[daemon] Incoming chat rejected from {}: {}",
+                                                peer_name, message
+                                            );
+                                            let _ = transport::send_wire_message(
+                                                &mut quic_send,
+                                                &WireMessage::Error { message },
+                                            )
+                                            .await;
+                                            let _ = quic_send.finish();
+                                            continue;
+                                        }
+                                    }
                                     println!("[daemon] Incoming chat validated for {}", peer_name);
                                 }
                             }
