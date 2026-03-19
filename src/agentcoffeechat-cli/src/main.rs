@@ -434,29 +434,37 @@ fn handle_connect(name: &str, peer_code: Option<&str>, json: bool) {
         .unwrap_or("");
 
     if json {
-        let info = serde_json::json!({
-            "ok": true,
-            "step": "pairing",
-            "your_code": our_code,
-            "message": "Share this code with your peer, then re-run with --peer-code <their-code>",
-        });
-        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string()));
+        // In JSON mode, auto-approve — the caller is an agent and has
+        // already decided to connect.
+        let peer_code = our_code.to_string();
+        let resp = send_or_exit(
+            &mut client,
+            &DaemonCommand::CompletePairing {
+                peer_name: name.to_string(),
+                peer_code,
+            },
+            json,
+        );
+        print_response(&resp, json);
         return;
     }
 
-    println!("Your pairing code: {}", our_code);
-    print!("Enter peer's code: ");
+    // Interactive mode: prompt the user to confirm.
+    println!("Connect to '{}'?", name);
+    print!("Allow? [y/n]: ");
     io::stdout().flush().ok();
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
-        eprintln!("Error: failed to read peer code from stdin.");
+        eprintln!("Error: failed to read input.");
         return;
     }
-    let peer_code = input.trim().to_string();
-    if !agentcoffeechat_core::validate_code(&peer_code) {
-        eprintln!("Error: '{}' is not a valid three-word code.", peer_code);
+    let answer = input.trim().to_lowercase();
+    if answer != "y" && answer != "yes" {
+        println!("Connection cancelled.");
         return;
     }
+    // Use our own code as session ID (peer does the same).
+    let peer_code = our_code.to_string();
 
     let resp = send_or_exit(
         &mut client,
