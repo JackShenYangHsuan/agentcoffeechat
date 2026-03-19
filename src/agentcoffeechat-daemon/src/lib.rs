@@ -2,7 +2,6 @@
 // other crates can access them.  The binary entry point remains in main.rs.
 
 pub mod ask_engine;
-pub mod auth;
 pub mod awdl;
 pub mod chat_engine;
 pub mod chat_history;

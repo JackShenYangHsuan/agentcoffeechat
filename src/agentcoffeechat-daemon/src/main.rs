@@ -15,7 +15,6 @@ use tokio::sync::Mutex;
 
 use agentcoffeechat_core::{socket_path, DaemonCommand, DaemonResponse};
 use agentcoffeechat_daemon::ask_engine::AskEngine;
-// auth validation functions removed — session existence + expiry check is sufficient
 use agentcoffeechat_daemon::awdl::{self, AwdlActivator};
 use agentcoffeechat_daemon::chat_engine;
 use agentcoffeechat_daemon::chat_history;
