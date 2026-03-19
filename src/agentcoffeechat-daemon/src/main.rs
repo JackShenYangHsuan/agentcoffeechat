@@ -248,31 +248,72 @@ async fn handle_command(
                 ));
             };
 
-            // Send a connection request to the peer's daemon over QUIC
-            // so they get a pending approval prompt.
+            // The peer MUST be discovered before we can connect.
             let peer_info = {
                 let peers = state.peers.lock().await;
                 peers.iter().find(|p| p.name == peer_name).cloned()
             };
-            if let Some(ref peer) = peer_info {
-                if let (Some(addr), Some(t)) = (peer.address, state.transport.as_ref()) {
-                    let socket_addr = SocketAddr::new(addr, peer.quic_port);
-                    let config = state.config.lock().await.clone();
-                    if let Ok(conn) = t.connect(socket_addr).await {
-                        if let Ok((mut send, _recv)) = conn.open_stream().await {
-                            let req = WireMessage::ConnectionRequest {
-                                peer_name: config.peer_label(),
-                                fingerprint_prefix: config.fingerprint_prefix.clone(),
-                            };
-                            let _ = transport::send_wire_message(&mut send, &req).await;
-                            let _ = send.finish();
-                            println!("[daemon] Sent connection request to {}", peer_name);
-                        }
-                    }
+
+            let peer = match peer_info {
+                Some(p) => p,
+                None => {
+                    // Put the pending pairing back so the user can retry.
+                    let mut pp = state.pending_pairings.lock().await;
+                    pp.insert(peer_name.clone(), pending);
+                    return DaemonResponse::error(format!(
+                        "peer '{}' not yet discovered — make sure they're nearby with `acc start` running, then try again",
+                        peer_name
+                    ));
                 }
+            };
+
+            let peer_addr = match peer.address {
+                Some(addr) => addr,
+                None => {
+                    let mut pp = state.pending_pairings.lock().await;
+                    pp.insert(peer_name.clone(), pending);
+                    return DaemonResponse::error(format!(
+                        "peer '{}' discovered but has no network address — try again in a moment",
+                        peer_name
+                    ));
+                }
+            };
+
+            let transport_ref = match state.transport.as_ref() {
+                Some(t) => t,
+                None => {
+                    return DaemonResponse::error("QUIC transport is not running".to_string());
+                }
+            };
+
+            // Send a ConnectionRequest to the peer's daemon over QUIC.
+            let socket_addr = SocketAddr::new(peer_addr, peer.quic_port);
+            let config = state.config.lock().await.clone();
+
+            let send_result = async {
+                let conn = transport_ref.connect(socket_addr).await?;
+                let (mut send, _recv) = conn.open_stream().await?;
+                let req = WireMessage::ConnectionRequest {
+                    peer_name: config.peer_label(),
+                    fingerprint_prefix: config.fingerprint_prefix.clone(),
+                };
+                transport::send_wire_message(&mut send, &req).await?;
+                let _ = send.finish();
+                Ok::<(), anyhow::Error>(())
+            }.await;
+
+            if let Err(e) = send_result {
+                let mut pp = state.pending_pairings.lock().await;
+                pp.insert(peer_name.clone(), pending);
+                return DaemonResponse::error(format!(
+                    "failed to send connection request to '{}' at {}: {} — try again",
+                    peer_name, socket_addr, e
+                ));
             }
 
-            // Create our local session immediately (we initiated).
+            println!("[daemon] Sent connection request to {} at {}", peer_name, socket_addr);
+
+            // Create our local session (we initiated, so our side is active).
             let mut mgr = state.session_mgr.lock().await;
             mgr.create_session(
                 &peer_name,
@@ -282,7 +323,7 @@ async fn handle_command(
             );
             println!("[daemon] Started session with {}", peer_name);
             DaemonResponse::success(format!(
-                "session started with {} for 1 hour — waiting for peer approval",
+                "connected to {} — waiting for their approval",
                 peer_name
             ))
         }
