@@ -214,9 +214,7 @@ impl AgentSession {
         let mut cmd = match self.ai_tool.as_str() {
             "claude-code" | "claude" => {
                 let mut c = Command::new("claude");
-                c.arg("--print")
-                    .arg("--model").arg("sonnet")
-                    .arg("--system-prompt").arg(&self.system_prompt);
+                c.arg("--print").arg("--model").arg("sonnet");
                 c
             }
             "codex" => {
@@ -240,11 +238,13 @@ impl AgentSession {
             .stderr(std::process::Stdio::null());
 
         let mut child = cmd.spawn().context("failed to spawn agent process")?;
-        let stdin_payload = if matches!(self.ai_tool.as_str(), "claude-code" | "claude") {
-            user_prompt.to_string()
-        } else {
-            format!("{}\n\n{}", self.system_prompt, user_prompt)
-        };
+
+        // Prepend the system prompt into stdin for all tools. This avoids
+        // --system-prompt flag issues (hooks, wrappers) and works universally.
+        let stdin_payload = format!(
+            "INSTRUCTIONS (follow these strictly):\n{}\n\n---\n\n{}",
+            self.system_prompt, user_prompt
+        );
 
         // Write prompt to stdin, then close it to signal EOF.
         {
