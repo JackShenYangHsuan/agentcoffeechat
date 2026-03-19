@@ -589,8 +589,30 @@ async fn handle_command(
 
             match engine.run_chat(send_tx, recv_rx, event_tx).await {
                 Ok(result) => {
+                    // Build metadata for this chat.
+                    let peer_fp = {
+                        let peers = state.peers.lock().await;
+                        peers.iter()
+                            .find(|p| p.name == peer_name)
+                            .map(|p| p.fingerprint_prefix.clone())
+                            .unwrap_or_default()
+                    };
+                    let metadata = agentcoffeechat_core::types::ChatMetadata {
+                        peer_name: peer_name.clone(),
+                        peer_fingerprint: peer_fp,
+                        local_name: config.display_name.clone(),
+                        local_fingerprint: config.fingerprint_prefix.clone(),
+                        ai_tool: config.ai_tool.clone(),
+                        started_at: chrono::Utc::now() - chrono::Duration::seconds(result.duration_secs as i64),
+                        ended_at: chrono::Utc::now(),
+                        message_count: result.message_count,
+                        duration_secs: result.duration_secs,
+                        completed: result.completed,
+                        phases_completed: result.phases_completed,
+                    };
+
                     // Save to history.
-                    let save_path = match chat_history::save_chat(&peer_name, &result) {
+                    let save_path = match chat_history::save_chat(&peer_name, &result, Some(&metadata)) {
                         Ok(path) => Some(path.to_string_lossy().to_string()),
                         Err(e) => {
                             eprintln!("[daemon] Failed to save chat history: {}", e);
@@ -602,8 +624,11 @@ async fn handle_command(
 
                     let data = serde_json::json!({
                         "peer_name": peer_name,
+                        "peer_fingerprint": metadata.peer_fingerprint,
                         "message_count": result.message_count,
                         "duration_secs": result.duration_secs,
+                        "completed": result.completed,
+                        "phases_completed": result.phases_completed,
                         "briefing": {
                             "what_building": result.briefing.what_building,
                             "learnings": result.briefing.learnings,
@@ -1475,7 +1500,20 @@ async fn main() -> Result<()> {
 
                             match engine.run_chat(send_tx, recv_rx, event_tx).await {
                                 Ok(result) => {
-                                    match chat_history::save_chat(&peer_name, &result) {
+                                    let metadata = agentcoffeechat_core::types::ChatMetadata {
+                                        peer_name: peer_name.clone(),
+                                        peer_fingerprint: String::new(), // incoming: we don't have peer's fp easily
+                                        local_name: config.display_name.clone(),
+                                        local_fingerprint: config.fingerprint_prefix.clone(),
+                                        ai_tool: config.ai_tool.clone(),
+                                        started_at: chrono::Utc::now() - chrono::Duration::seconds(result.duration_secs as i64),
+                                        ended_at: chrono::Utc::now(),
+                                        message_count: result.message_count,
+                                        duration_secs: result.duration_secs,
+                                        completed: result.completed,
+                                        phases_completed: result.phases_completed,
+                                    };
+                                    match chat_history::save_chat(&peer_name, &result, Some(&metadata)) {
                                         Ok(path) => {
                                             println!(
                                                 "[daemon] Incoming chat saved to {}",

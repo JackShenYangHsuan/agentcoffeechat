@@ -275,6 +275,37 @@ pub struct CoffeeChatOutput {
 }
 
 // ---------------------------------------------------------------------------
+// ChatMetadata — structured metadata saved with each chat
+// ---------------------------------------------------------------------------
+
+/// Metadata saved alongside each chat for identity, correlation, and replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMetadata {
+    /// Peer's display name.
+    pub peer_name: String,
+    /// Peer's fingerprint prefix (first 16 hex chars of identity hash).
+    pub peer_fingerprint: String,
+    /// Our own display name.
+    pub local_name: String,
+    /// Our own fingerprint prefix.
+    pub local_fingerprint: String,
+    /// Which AI tool was used for the chat.
+    pub ai_tool: String,
+    /// When the chat started (ISO 8601).
+    pub started_at: DateTime<Utc>,
+    /// When the chat ended (ISO 8601).
+    pub ended_at: DateTime<Utc>,
+    /// Total number of messages exchanged.
+    pub message_count: usize,
+    /// Duration in seconds.
+    pub duration_secs: u64,
+    /// Whether the chat completed fully or was partial (peer disconnect, etc.).
+    pub completed: bool,
+    /// Number of conversation phases completed (out of 5).
+    pub phases_completed: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Config — local configuration
 // ---------------------------------------------------------------------------
 

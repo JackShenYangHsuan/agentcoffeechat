@@ -324,11 +324,11 @@ fn chat_history_roundtrip_save_and_load() {
         briefing: briefing.clone(),
         output,
         duration_secs: 300,
-        message_count: 4,
+        message_count: 4, completed: true, phases_completed: 5,
     };
 
     // Save the chat.
-    let saved_path = agentcoffeechat_daemon::chat_history::save_chat("test-peer", &chat_result)
+    let saved_path = agentcoffeechat_daemon::chat_history::save_chat("test-peer", &chat_result, None)
         .expect("save_chat should succeed");
     assert!(saved_path.exists(), "Chat directory should exist");
 
@@ -427,15 +427,15 @@ fn chat_history_multiple_chats_ordered() {
         },
         output: Default::default(),
         duration_secs: 60,
-        message_count: 1,
+        message_count: 1, completed: true, phases_completed: 5,
     };
 
     // Save two chats for the same peer. There's a small time gap between them.
-    agentcoffeechat_daemon::chat_history::save_chat("alice", &make_result("First chat"))
+    agentcoffeechat_daemon::chat_history::save_chat("alice", &make_result("First chat"), None)
         .expect("first save");
     // Ensure different timestamps by sleeping a tiny bit.
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    agentcoffeechat_daemon::chat_history::save_chat("alice", &make_result("Second chat"))
+    agentcoffeechat_daemon::chat_history::save_chat("alice", &make_result("Second chat"), None)
         .expect("second save");
 
     let chats = agentcoffeechat_daemon::chat_history::list_chats().expect("list");
@@ -1076,11 +1076,11 @@ fn cross_module_session_sanitize_and_save() {
         briefing,
         output,
         duration_secs: 60,
-        message_count: 1,
+        message_count: 1, completed: true, phases_completed: 5,
     };
 
     // 4. Save and retrieve.
-    agentcoffeechat_daemon::chat_history::save_chat("bob", &chat_result)
+    agentcoffeechat_daemon::chat_history::save_chat("bob", &chat_result, None)
         .expect("save should succeed");
 
     let briefings =

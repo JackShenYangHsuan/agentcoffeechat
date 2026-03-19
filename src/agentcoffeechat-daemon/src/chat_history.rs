@@ -7,6 +7,7 @@
 //       briefing.md           — Legacy briefing (backward compat)
 //       briefing-human.md     — Human-facing pre-meeting note
 //       briefing-agent.json   — Structured agent memo (machine-actionable)
+//       metadata.json         — Identity, timestamps, completion status
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::chat_engine::ChatResult;
-use agentcoffeechat_core::types::{ChatBriefing, HumanBriefing, Message};
+use agentcoffeechat_core::types::{ChatBriefing, ChatMetadata, HumanBriefing, Message};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,10 +48,13 @@ pub struct ChatHistoryEntry {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Save a chat result (transcript + briefing) to disk.
+/// Save a chat result (transcript + briefing + metadata) to disk.
+///
+/// `metadata` is optional — if provided, it's saved as `metadata.json` alongside
+/// the transcript and briefings. This enables future session pickup and correlation.
 ///
 /// Returns the path to the created directory.
-pub fn save_chat(peer_name: &str, result: &ChatResult) -> Result<PathBuf> {
+pub fn save_chat(peer_name: &str, result: &ChatResult, metadata: Option<&ChatMetadata>) -> Result<PathBuf> {
     let now = Utc::now();
     let timestamp_str = now.format("%Y%m%d-%H%M%S").to_string();
     let dir_name = format!("{}-{}", sanitize_filename(peer_name), timestamp_str);
@@ -103,6 +107,19 @@ pub fn save_chat(peer_name: &str, result: &ChatResult) -> Result<PathBuf> {
             agent_path.display()
         )
     })?;
+
+    // Write metadata.json (identity, timestamps, completion status)
+    if let Some(meta) = metadata {
+        let meta_path = chat_dir.join("metadata.json");
+        let meta_json = serde_json::to_string_pretty(meta)
+            .unwrap_or_else(|_| "{}".to_string());
+        std::fs::write(&meta_path, &meta_json).with_context(|| {
+            format!(
+                "failed to write metadata: {}",
+                meta_path.display()
+            )
+        })?;
+    }
 
     Ok(chat_dir)
 }

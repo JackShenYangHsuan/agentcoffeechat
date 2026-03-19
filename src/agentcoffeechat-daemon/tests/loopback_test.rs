@@ -471,7 +471,7 @@ async fn simulated_chat_produces_transcript_and_briefing() {
         briefing,
         output: Default::default(),
         duration_secs: 120,
-        message_count: 6,
+        message_count: 6, completed: true, phases_completed: 5,
     };
 
     assert_eq!(result.message_count, 6);

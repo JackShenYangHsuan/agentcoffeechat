@@ -291,6 +291,10 @@ pub struct ChatResult {
     pub duration_secs: u64,
     /// Total number of messages exchanged (both sides).
     pub message_count: usize,
+    /// Whether the chat completed all phases or was partial.
+    pub completed: bool,
+    /// Number of phases completed (out of 5).
+    pub phases_completed: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,7 +1162,7 @@ impl ChatEngine {
             Ok(())
         }.await;
 
-        if let Err(e) = conversation_result {
+        if let Err(ref e) = conversation_result {
             eprintln!("[chat_engine] Mid-chat failure: {:#}", e);
             let _ = transcript_tx
                 .send(ChatEvent::Status(
@@ -1238,6 +1242,15 @@ impl ChatEngine {
 
         let duration_secs = start.elapsed().as_secs();
         let message_count = transcript.len();
+        let completed = conversation_result.is_ok();
+        // Phase 1 (intro) always completes if we reach here. Count guided phases + wrapup.
+        let phases_completed = if completed { 5 } else {
+            // Intro completed (1) + however many guided phases ran before failure.
+            // Approximate from transcript: count distinct Exchange-phase messages / 2 for rough phase count.
+            let exchange_msgs = transcript.iter().filter(|m| m.phase == MessagePhase::Exchange).count();
+            let approx_phases = (exchange_msgs / 4).min(3); // ~4 msgs per guided phase, max 3 guided
+            1 + approx_phases as u32
+        };
 
         let _ = transcript_tx.send(ChatEvent::Complete).await;
 
@@ -1247,6 +1260,8 @@ impl ChatEngine {
             output,
             duration_secs,
             message_count,
+            completed,
+            phases_completed,
         })
     }
 
