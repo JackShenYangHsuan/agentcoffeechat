@@ -1,9 +1,9 @@
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
-
-const KEYCHAIN_SERVICE: &str = "com.agentcoffeechat.identity";
-const KEYCHAIN_ACCOUNT: &str = "ed25519-private-key";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -17,7 +17,7 @@ pub struct Identity {
     pub fingerprint: String,
     /// Raw public key bytes (32 bytes).
     pub public_key_bytes: [u8; 32],
-    /// First 16 hex chars of the fingerprint hash — used as the BLE/mDNS
+    /// First 16 hex chars of the fingerprint hash — used as the mDNS
     /// identifier.
     pub fingerprint_prefix: String,
 }
@@ -26,79 +26,88 @@ pub struct Identity {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Load the Ed25519 identity from the macOS Keychain, or generate a new one
-/// if none exists yet.
+/// Return the path to the private key file.
+fn key_file_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agentcoffeechat")
+        .join("identity.key")
+}
+
+/// Return the path to the public key file.
+fn pub_file_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agentcoffeechat")
+        .join("identity.pub")
+}
+
+/// Load the Ed25519 identity from `~/.agentcoffeechat/identity.key`, or
+/// generate a new one if none exists yet.
 ///
-/// The private key is stored in the Keychain under service
-/// `com.agentcoffeechat.identity`, account `ed25519-private-key`.
-///
-/// The public key is additionally written to `~/.agentcoffeechat/identity.pub`
-/// (base64-encoded) for easy inspection.
+/// The private key is stored as raw 32 bytes with 0600 permissions.
+/// The public key is written alongside as base64 for easy inspection.
 pub fn get_or_create_identity() -> Result<Identity> {
-    // Try to load an existing private key from the Keychain.
-    match load_private_key_from_keychain() {
-        Ok(signing_key) => {
-            let identity = identity_from_signing_key(&signing_key)?;
-            Ok(identity)
+    let key_path = key_file_path();
+
+    if key_path.exists() {
+        // Load existing key.
+        let key_bytes = std::fs::read(&key_path)
+            .with_context(|| format!("failed to read {}", key_path.display()))?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "identity key file has unexpected length {} (expected 32)",
+                key_bytes.len()
+            );
         }
-        Err(_) => {
-            // No key found (or Keychain read failed) — generate a fresh one.
-            let signing_key = generate_and_store_key()?;
-            let identity = identity_from_signing_key(&signing_key)?;
-            Ok(identity)
-        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&key_bytes);
+        let signing_key = SigningKey::from_bytes(&buf);
+        identity_from_signing_key(&signing_key)
+    } else {
+        // Generate and store a new key.
+        let signing_key = generate_and_store_key()?;
+        identity_from_signing_key(&signing_key)
     }
 }
 
-/// Check whether an Ed25519 identity already exists in the macOS Keychain.
+/// Check whether an identity key file exists.
+pub fn identity_exists() -> bool {
+    key_file_path().exists()
+}
+
+// Keep the old name as an alias for backward compatibility with doctor.rs
 pub fn identity_exists_in_keychain() -> bool {
-    load_private_key_from_keychain().is_ok()
+    identity_exists()
 }
 
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Attempt to load the 32-byte Ed25519 private key from the macOS Keychain.
-fn load_private_key_from_keychain() -> Result<SigningKey> {
-    let key_bytes = security_framework::passwords::get_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-    )
-    .context("Ed25519 key not found in Keychain")?;
-
-    if key_bytes.len() != 32 {
-        anyhow::bail!(
-            "Keychain entry has unexpected length {} (expected 32)",
-            key_bytes.len()
-        );
-    }
-
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&key_bytes);
-    Ok(SigningKey::from_bytes(&buf))
-}
-
-/// Generate a new Ed25519 keypair, store the private key in the Keychain, and
-/// return the signing key.
+/// Generate a new Ed25519 keypair, store it to disk, and return the
+/// signing key.
 fn generate_and_store_key() -> Result<SigningKey> {
     let mut csprng = rand::rngs::OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
 
-    // Store private key (raw 32 bytes) in the Keychain.
-    security_framework::passwords::set_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-        signing_key.as_bytes(),
-    )
-    .context("Failed to store Ed25519 key in Keychain")?;
+    let key_path = key_file_path();
 
-    // Also persist the public key to disk for easy inspection.
+    // Ensure directory exists.
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    // Write private key with restrictive permissions (0600).
+    std::fs::write(&key_path, signing_key.as_bytes())
+        .with_context(|| format!("failed to write {}", key_path.display()))?;
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", key_path.display()))?;
+
+    // Write public key for easy inspection.
     if let Err(e) = save_public_key_file(&signing_key) {
-        eprintln!(
-            "[identity] Warning: could not write identity.pub: {}",
-            e
-        );
+        eprintln!("[identity] Warning: could not write identity.pub: {}", e);
     }
 
     Ok(signing_key)
@@ -133,16 +142,10 @@ fn save_public_key_file(signing_key: &SigningKey) -> Result<()> {
     let verifying_key = signing_key.verifying_key();
     let pub_bytes = verifying_key.to_bytes();
 
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".agentcoffeechat");
-    std::fs::create_dir_all(&dir)
-        .context("Failed to create ~/.agentcoffeechat directory")?;
-
-    let pub_path = dir.join("identity.pub");
+    let pub_path = pub_file_path();
     let encoded = base64::engine::general_purpose::STANDARD.encode(pub_bytes);
     std::fs::write(&pub_path, format!("{}\n", encoded))
-        .with_context(|| format!("Failed to write {}", pub_path.display()))?;
+        .with_context(|| format!("failed to write {}", pub_path.display()))?;
 
     Ok(())
 }

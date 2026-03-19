@@ -14,7 +14,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use agentcoffeechat_core::types::{ChatBriefing, Message, MessagePhase, MessageSender, MessageType};
+use agentcoffeechat_core::types::{
+    AgentMemo, ChatBriefing, CoffeeChatOutput, HumanBriefing, Message, MessagePhase,
+    MessageSender, MessageType,
+};
 use agentcoffeechat_core::SanitizationPipeline;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +109,64 @@ const BRIEFING_PROMPT: &str = r#"The coffee chat is over. Based on the full tran
 Be specific and concise. Focus on genuinely useful information."#;
 
 // ---------------------------------------------------------------------------
+// Human briefing prompt
+// ---------------------------------------------------------------------------
+
+const HUMAN_BRIEFING_PROMPT: &str = r#"The coffee chat is over. Produce a HUMAN BRIEFING — a pre-meeting note for the developer who will meet this person.
+
+Based on the full transcript and local context above, produce JSON in exactly this format (no markdown fences, just raw JSON):
+{
+  "project_arc": "The full project story: why it started, key pivots, where it's headed. 2-3 sentences.",
+  "current_focus": "What they're actively building right now — current branch, recent work, active task. 1-2 sentences.",
+  "setup_comparison": "Their agent setup vs ours: MCP servers, plugins, hooks, memory strategies, CLAUDE.md structure. Highlight what they have that we don't and vice versa. Be specific.",
+  "overlaps": "Thematic overlap (similar domains, tech stacks, challenges) and any code-level overlap (shared deps, similar modules). Prioritize thematic.",
+  "candid_takes": "Frustrations, failures, and what they'd do differently. Be honest — these are the most valuable signals.",
+  "conversation_starters": [
+    "🔍 [Understanding question — high-level, helps grasp who they are and what they're building]",
+    "🔍 [Another understanding question]",
+    "🤝 [Collaboration question — based on overlap, both hitting same problem]",
+    "🤝 [Another collaboration opportunity]",
+    "🌶️ [Spicy/provocative question — challenge a decision, suggest an alternative, dig deeper]",
+    "🌶️ [Another spicy question]"
+  ]
+}
+
+Guidelines:
+- conversation_starters should be layered: start with understanding, then collaboration, then spicy.
+- Be specific — reference actual projects, tools, and decisions from the chat.
+- candid_takes should include real frustrations and failures shared during the chat.
+- setup_comparison should be concrete: name specific tools, plugins, MCP servers."#;
+
+// ---------------------------------------------------------------------------
+// Agent memo prompt
+// ---------------------------------------------------------------------------
+
+const AGENT_MEMO_PROMPT: &str = r#"The coffee chat is over. Produce an AGENT MEMO — structured data for the coding agent to act on in future sessions.
+
+Based on the full transcript and local context above, produce JSON in exactly this format (no markdown fences, just raw JSON):
+{
+  "setup_diffs": {
+    "they_have": ["Specific tool/plugin/MCP server they have that we don't"],
+    "we_have": ["Specific tool/plugin we have that they don't"],
+    "suggested_additions": ["Install X because they found it useful for Y"]
+  },
+  "workflow_improvements": ["Concrete workflow change observed from their setup"],
+  "debottleneck_ideas": ["Pattern from their setup that could speed up our sessions"],
+  "blindspots_surfaced": ["Gap the peer noticed or that became apparent — e.g. no tests, missing tooling, inefficient pattern"],
+  "agentic_tips": {
+    "human_workflows": ["How their human uses the AI agent — prompting strategies, context management, commands"],
+    "agent_techniques": ["Techniques the agent itself found effective — tool patterns, memory strategies"]
+  },
+  "follow_up_actions": ["Concrete action: 'Install MCP server X', 'Add hook for Y', 'Try Z workflow'"]
+}
+
+Guidelines:
+- Every item should be specific and actionable, not generic advice.
+- setup_diffs should reference actual tools/plugins/MCP servers mentioned in the chat.
+- follow_up_actions should be things the agent can actually do (install commands, config changes, code changes).
+- If something wasn't discussed, use an empty array — don't make things up."#;
+
+// ---------------------------------------------------------------------------
 // ChatConfig
 // ---------------------------------------------------------------------------
 
@@ -169,8 +230,10 @@ pub enum ChatEvent {
 pub struct ChatResult {
     /// Full ordered transcript of messages exchanged.
     pub transcript: Vec<Message>,
-    /// Structured briefing produced by the agent.
+    /// Structured briefing produced by the agent (legacy format).
     pub briefing: ChatBriefing,
+    /// New split output: human briefing + agent memo.
+    pub output: CoffeeChatOutput,
     /// Wall-clock duration of the chat in seconds.
     pub duration_secs: u64,
     /// Total number of messages exchanged (both sides).
@@ -331,7 +394,7 @@ async fn gather_local_context(project_root: &Path) -> String {
     }
 
     // -----------------------------------------------------------------
-    // 2. Git branch + recent commits
+    // 2. Git: branch, recent commits, contributors, branches, diff
     // -----------------------------------------------------------------
     if let Some(branch) = run_git_command(project_root, &["branch", "--show-current"]).await {
         let branch = branch.trim().to_string();
@@ -340,10 +403,42 @@ async fn gather_local_context(project_root: &Path) -> String {
         }
     }
 
-    if let Some(log) = run_git_command(project_root, &["log", "--oneline", "-10"]).await {
+    // Extended commit history (30 commits for full arc context)
+    if let Some(log) = run_git_command(project_root, &["log", "--oneline", "-30"]).await {
         let log = log.trim().to_string();
         if !log.is_empty() {
-            sections.push(format!("Recent commits:\n{}", log));
+            sections.push(format!("Recent commits (last 30):\n{}", log));
+        }
+    }
+
+    // Git contributors
+    if let Some(contributors) = run_git_command(project_root, &["shortlog", "-sn", "--all"]).await {
+        let contributors = contributors.trim().to_string();
+        if !contributors.is_empty() {
+            sections.push(format!("Git contributors:\n{}", contributors));
+        }
+    }
+
+    // Recent branches (for understanding what's being explored)
+    if let Some(branches) = run_git_command(
+        project_root,
+        &["branch", "--sort=-committerdate", "--format=%(refname:short)", "--no-color"],
+    ).await {
+        let branches: String = branches
+            .lines()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !branches.is_empty() {
+            sections.push(format!("Recent branches: {}", branches));
+        }
+    }
+
+    // Current diff stats (what's being actively changed)
+    if let Some(diff) = run_git_command(project_root, &["diff", "--stat"]).await {
+        let diff = diff.trim().to_string();
+        if !diff.is_empty() {
+            sections.push(format!("Uncommitted changes:\n{}", diff));
         }
     }
 
@@ -432,6 +527,14 @@ async fn gather_local_context(project_root: &Path) -> String {
         .join("sessions-index.json");
     if let Some(content) = read_file_prefix(&sessions_index, 2000).await {
         sections.push(format!("Recent coding sessions (index):\n{}", content));
+    }
+
+    // -----------------------------------------------------------------
+    // 10. Compacted session history (from Claude Code .jsonl files)
+    // -----------------------------------------------------------------
+    let session_history = compact_session_history(project_root).await;
+    if !session_history.is_empty() {
+        sections.push(session_history);
     }
 
     if sections.is_empty() {
@@ -539,6 +642,189 @@ async fn read_file_prefix(path: &Path, max_chars: usize) -> Option<String> {
         // Truncate at a char boundary.
         let truncated: String = content.chars().take(max_chars).collect();
         Some(truncated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session history compaction
+// ---------------------------------------------------------------------------
+
+/// Maximum number of past sessions to compact.
+const MAX_SESSIONS_TO_COMPACT: usize = 10;
+
+/// Maximum characters per compacted message.
+const COMPACT_MSG_CHARS: usize = 200;
+
+/// Compact Claude Code session history from `.jsonl` files into a concise
+/// summary of what the user and agent have been working on.
+///
+/// Reads the JSONL session files, extracts only `user` (human text) and
+/// `assistant` (text blocks) records, truncates each, and produces a
+/// chronological summary.  A 14MB session compacts to ~2-3KB.
+async fn compact_session_history(project_root: &Path) -> String {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+    let home_path = PathBuf::from(&home);
+
+    // Claude Code stores sessions under ~/.claude/projects/<slug>/
+    let project_slug = project_root
+        .to_string_lossy()
+        .replace('/', "-");
+    let sessions_dir = home_path
+        .join(".claude")
+        .join("projects")
+        .join(&project_slug);
+
+    if !sessions_dir.exists() {
+        return String::new();
+    }
+
+    // Find .jsonl files, sorted by modification time (most recent first).
+    let mut jsonl_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                if let Ok(meta) = entry.metadata().await {
+                    if let Ok(modified) = meta.modified() {
+                        jsonl_files.push((path, modified));
+                    }
+                }
+            }
+        }
+    }
+
+    jsonl_files.sort_by(|a, b| b.1.cmp(&a.1));
+    jsonl_files.truncate(MAX_SESSIONS_TO_COMPACT);
+
+    // Process each session in reverse chronological order.
+    let mut sections: Vec<String> = Vec::new();
+    for (path, _modified) in &jsonl_files {
+        if let Some(compacted) = compact_single_session(path).await {
+            if !compacted.is_empty() {
+                sections.push(compacted);
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "=== RECENT SESSION HISTORY (compacted from Claude Code sessions) ===\n\n{}\n\n=== END SESSION HISTORY ===",
+        sections.join("\n---\n\n")
+    )
+}
+
+/// Compact a single JSONL session file into a summary.
+async fn compact_single_session(path: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut session_timestamp = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let record_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if session_timestamp.is_empty() && !timestamp.is_empty() {
+            // Take first 16 chars: "2026-03-18T20:22"
+            session_timestamp = timestamp.chars().take(16).collect();
+        }
+
+        match record_type {
+            "user" => {
+                let content = obj.get("message")
+                    .and_then(|m| m.get("content"));
+                if let Some(content) = content {
+                    let text = extract_text_from_content(content);
+                    if !text.is_empty() {
+                        let truncated: String = text.chars().take(COMPACT_MSG_CHARS).collect();
+                        entries.push(format!("  USER: {}", truncated));
+                    }
+                }
+            }
+            "assistant" => {
+                let content = obj.get("message")
+                    .and_then(|m| m.get("content"));
+                if let Some(serde_json::Value::Array(blocks)) = content {
+                    let mut texts = Vec::new();
+                    let mut tool_calls = Vec::new();
+                    for block in blocks {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let truncated: String =
+                                        text.chars().take(COMPACT_MSG_CHARS).collect();
+                                    texts.push(truncated);
+                                }
+                            }
+                            Some("tool_use") => {
+                                if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                    tool_calls.push(name.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !texts.is_empty() {
+                        entries.push(format!("  AGENT: {}", texts.join(" ")));
+                    }
+                    if !tool_calls.is_empty() {
+                        entries.push(format!("  TOOLS: {}", tool_calls.join(", ")));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Session {}:\n{}",
+        session_timestamp,
+        entries.join("\n")
+    ))
+}
+
+/// Extract text from a message content field (string or array of blocks).
+fn extract_text_from_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut text = String::new();
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(t);
+                    }
+                }
+            }
+            text
+        }
+        _ => String::new(),
     }
 }
 
@@ -850,21 +1136,51 @@ impl ChatEngine {
         }
 
         // ---------------------------------------------------------------
-        // Phase 4: Briefing
+        // Phase 4: Briefing (generates legacy + human + agent outputs)
         // ---------------------------------------------------------------
         let _ = transcript_tx
             .send(ChatEvent::Phase("briefing".into()))
             .await;
 
+        // Generate all three briefing formats concurrently-ish (sequential
+        // since they share the session, but each is a separate agent call).
         let briefing = self
             .generate_briefing(&mut session, &transcript)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("[chat_engine] Briefing generation failed: {:#}", e);
+                eprintln!("[chat_engine] Legacy briefing generation failed: {:#}", e);
                 ChatBriefing::default()
             });
 
-        let briefing_text = format_briefing(&briefing);
+        let _ = transcript_tx
+            .send(ChatEvent::Status("Generating human briefing...".into()))
+            .await;
+        let human_briefing = self
+            .generate_human_briefing(&mut session, &transcript)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[chat_engine] Human briefing generation failed: {:#}", e);
+                HumanBriefing::default()
+            });
+
+        let _ = transcript_tx
+            .send(ChatEvent::Status("Generating agent memo...".into()))
+            .await;
+        let agent_memo = self
+            .generate_agent_memo(&mut session, &transcript)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[chat_engine] Agent memo generation failed: {:#}", e);
+                AgentMemo::default()
+            });
+
+        let output = CoffeeChatOutput {
+            human_briefing,
+            agent_memo,
+            legacy_briefing: briefing.clone(),
+        };
+
+        let briefing_text = format_human_briefing(&output.human_briefing);
         let _ = transcript_tx
             .send(ChatEvent::Briefing(briefing_text))
             .await;
@@ -882,6 +1198,7 @@ impl ChatEngine {
         Ok(ChatResult {
             transcript,
             briefing,
+            output,
             duration_secs,
             message_count,
         })
@@ -968,6 +1285,63 @@ impl ChatEngine {
 
         Ok(briefing)
     }
+
+    /// Ask the agent to produce a human-facing briefing from the transcript.
+    async fn generate_human_briefing(
+        &self,
+        session: &mut AgentSession,
+        transcript: &[Message],
+    ) -> Result<HumanBriefing> {
+        let mut prompt = String::from("=== FULL TRANSCRIPT ===\n");
+        for msg in transcript {
+            let speaker = if msg.from.name == "peer" { "PEER" } else { "YOU" };
+            prompt.push_str(&format!("[{}] {}\n\n", speaker, msg.body));
+        }
+        prompt.push_str("=== END TRANSCRIPT ===\n\n");
+        prompt.push_str(HUMAN_BRIEFING_PROMPT);
+
+        let raw = session
+            .query(&prompt)
+            .await
+            .unwrap_or_else(|_| "{}".to_string());
+
+        let json_str = extract_json_object(&raw).unwrap_or_else(|| raw.clone());
+
+        let briefing: HumanBriefing = serde_json::from_str(&json_str).unwrap_or_else(|_| {
+            HumanBriefing {
+                project_arc: raw.lines().next().unwrap_or("Unknown").to_string(),
+                ..Default::default()
+            }
+        });
+
+        Ok(briefing)
+    }
+
+    /// Ask the agent to produce a structured agent memo from the transcript.
+    async fn generate_agent_memo(
+        &self,
+        session: &mut AgentSession,
+        transcript: &[Message],
+    ) -> Result<AgentMemo> {
+        let mut prompt = String::from("=== FULL TRANSCRIPT ===\n");
+        for msg in transcript {
+            let speaker = if msg.from.name == "peer" { "PEER" } else { "YOU" };
+            prompt.push_str(&format!("[{}] {}\n\n", speaker, msg.body));
+        }
+        prompt.push_str("=== END TRANSCRIPT ===\n\n");
+        prompt.push_str(AGENT_MEMO_PROMPT);
+
+        let raw = session
+            .query(&prompt)
+            .await
+            .unwrap_or_else(|_| "{}".to_string());
+
+        let json_str = extract_json_object(&raw).unwrap_or_else(|| raw.clone());
+
+        let memo: AgentMemo = serde_json::from_str(&json_str).unwrap_or_default();
+
+        Ok(memo)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1384,52 @@ fn extract_json_object(text: &str) -> Option<String> {
     }
 }
 
-/// Format a `ChatBriefing` into a human-readable string.
+/// Format a `HumanBriefing` into a human-readable string for terminal display.
+fn format_human_briefing(briefing: &HumanBriefing) -> String {
+    let mut out = String::new();
+
+    if !briefing.project_arc.is_empty() {
+        out.push_str("## Their project\n");
+        out.push_str(&briefing.project_arc);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.current_focus.is_empty() {
+        out.push_str("## What they're building now\n");
+        out.push_str(&briefing.current_focus);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.setup_comparison.is_empty() {
+        out.push_str("## Their setup vs yours\n");
+        out.push_str(&briefing.setup_comparison);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.overlaps.is_empty() {
+        out.push_str("## Where your work overlaps\n");
+        out.push_str(&briefing.overlaps);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.candid_takes.is_empty() {
+        out.push_str("## Candid takes\n");
+        out.push_str(&briefing.candid_takes);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.conversation_starters.is_empty() {
+        out.push_str("## Conversation starters\n");
+        for starter in &briefing.conversation_starters {
+            out.push_str(&format!("- {}\n", starter));
+        }
+    }
+
+    out
+}
+
+/// Format a `ChatBriefing` into a human-readable string (legacy format).
+#[allow(dead_code)]
 fn format_briefing(briefing: &ChatBriefing) -> String {
     let mut out = String::new();
 

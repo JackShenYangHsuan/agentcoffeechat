@@ -236,10 +236,35 @@ pub fn replay_chat(display: &ChatDisplay, data: &serde_json::Value) {
     ));
     println!();
 
-    // Display the briefing.
-    if !briefing_text.is_empty() {
+    // Display the human briefing if available, otherwise fall back to legacy.
+    let has_human_briefing = data
+        .get("human_briefing")
+        .and_then(|v| v.get("project_arc"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if has_human_briefing {
+        display.show_phase("briefing");
+        display_human_briefing(display, data.get("human_briefing").unwrap());
+    } else if !briefing_text.is_empty() {
         display.show_phase("briefing");
         display.show_briefing(briefing_text);
+    }
+
+    // Show agent memo summary if available.
+    if let Some(memo) = data.get("agent_memo") {
+        let actions = memo
+            .get("follow_up_actions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if actions > 0 {
+            display.show_status(&format!(
+                "Agent memo: {} follow-up action(s) saved",
+                actions
+            ));
+        }
     }
 
     // Footer.
@@ -247,6 +272,63 @@ pub fn replay_chat(display: &ChatDisplay, data: &serde_json::Value) {
         println!();
         display.show_status(&format!("Saved to: {}", path));
     }
+}
+
+/// Render the human briefing from JSON data using the ChatDisplay.
+fn display_human_briefing(display: &ChatDisplay, data: &serde_json::Value) {
+    let get_str = |key: &str| -> &str {
+        data.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    };
+
+    let mut briefing_text = String::new();
+
+    let project_arc = get_str("project_arc");
+    if !project_arc.is_empty() {
+        briefing_text.push_str("## Their project\n");
+        briefing_text.push_str(project_arc);
+        briefing_text.push_str("\n\n");
+    }
+
+    let current_focus = get_str("current_focus");
+    if !current_focus.is_empty() {
+        briefing_text.push_str("## What they're building now\n");
+        briefing_text.push_str(current_focus);
+        briefing_text.push_str("\n\n");
+    }
+
+    let setup = get_str("setup_comparison");
+    if !setup.is_empty() {
+        briefing_text.push_str("## Their setup vs yours\n");
+        briefing_text.push_str(setup);
+        briefing_text.push_str("\n\n");
+    }
+
+    let overlaps = get_str("overlaps");
+    if !overlaps.is_empty() {
+        briefing_text.push_str("## Where your work overlaps\n");
+        briefing_text.push_str(overlaps);
+        briefing_text.push_str("\n\n");
+    }
+
+    let candid = get_str("candid_takes");
+    if !candid.is_empty() {
+        briefing_text.push_str("## Candid takes\n");
+        briefing_text.push_str(candid);
+        briefing_text.push_str("\n\n");
+    }
+
+    if let Some(starters) = data.get("conversation_starters").and_then(|v| v.as_array()) {
+        if !starters.is_empty() {
+            briefing_text.push_str("## Conversation starters\n");
+            for starter in starters {
+                if let Some(s) = starter.as_str() {
+                    briefing_text.push_str(&format!("- {}\n", s));
+                }
+            }
+        }
+    }
+
+    display.show_briefing(&briefing_text);
 }
 
 #[cfg(test)]

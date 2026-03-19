@@ -78,27 +78,27 @@ fn try_session_count(client: &mut IpcClient) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 fn check_keychain() -> DoctorCheck {
-    if crate::identity::identity_exists_in_keychain() {
+    if crate::identity::identity_exists() {
         match crate::identity::get_or_create_identity() {
             Ok(identity) => DoctorCheck {
-                name: "Keychain".into(),
+                name: "Identity".into(),
                 status: CheckStatus::Pass,
                 message: format!(
-                    "Ed25519 identity found in Keychain (fingerprint: {})",
+                    "Ed25519 identity found (fingerprint: {})",
                     identity.fingerprint
                 ),
             },
             Err(e) => DoctorCheck {
-                name: "Keychain".into(),
+                name: "Identity".into(),
                 status: CheckStatus::Fail,
-                message: format!("Ed25519 key exists but could not load identity: {}", e),
+                message: format!("identity key exists but could not load: {}", e),
             },
         }
     } else {
         DoctorCheck {
-            name: "Keychain".into(),
+            name: "Identity".into(),
             status: CheckStatus::Fail,
-            message: "Ed25519 identity not found in macOS Keychain (run the daemon to generate one)".into(),
+            message: "Ed25519 identity not found (run `acc start` to generate one)".into(),
         }
     }
 }

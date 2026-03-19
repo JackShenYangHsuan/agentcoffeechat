@@ -186,12 +186,92 @@ impl Session {
 // ChatBriefing — summary produced after a chat session
 // ---------------------------------------------------------------------------
 
+/// Legacy briefing format (kept for backward compatibility with old chats).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatBriefing {
     pub what_building: String,
     pub learnings: Vec<String>,
     pub tips: Vec<String>,
     pub ideas_to_explore: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// HumanBriefing — pre-meeting note for the developer
+// ---------------------------------------------------------------------------
+
+/// Human-facing briefing: a pre-meeting note that helps the developer
+/// understand who the other person is and gives conversation starters.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HumanBriefing {
+    /// Full project story: why it started, key pivots, where it's headed.
+    pub project_arc: String,
+    /// What they're actively building right now (branch, recent commits, task).
+    pub current_focus: String,
+    /// Their agent setup compared to yours (what they have that you don't).
+    pub setup_comparison: String,
+    /// Thematic and code-level overlap between your projects.
+    pub overlaps: String,
+    /// Candid takes: frustrations, failures, what they'd do differently.
+    pub candid_takes: String,
+    /// Layered conversation starters:
+    /// 1. Understanding (high-level), 2. Collaboration, 3. Spicy/provocative.
+    pub conversation_starters: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// AgentMemo — structured actionable memo for the coding agent
+// ---------------------------------------------------------------------------
+
+/// Agent-facing memo: structured data the coding agent can act on in future
+/// sessions to improve its own setup and workflow.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentMemo {
+    /// Setup diffs: plugins/MCP/hooks they have that we don't, and vice versa.
+    pub setup_diffs: SetupDiffs,
+    /// Concrete workflow improvements observed from the peer.
+    pub workflow_improvements: Vec<String>,
+    /// Patterns from their setup that could speed up our sessions.
+    pub debottleneck_ideas: Vec<String>,
+    /// Blindspots: gaps the peer surfaced (e.g. no tests, missing tooling).
+    pub blindspots_surfaced: Vec<String>,
+    /// Tips for working agentically — human workflows + agent techniques.
+    pub agentic_tips: AgenticTips,
+    /// Concrete follow-up actions to take.
+    pub follow_up_actions: Vec<String>,
+}
+
+/// Differences in agent setup between the two sides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SetupDiffs {
+    /// Things the peer has that we don't.
+    pub they_have: Vec<String>,
+    /// Things we have that the peer doesn't.
+    pub we_have: Vec<String>,
+    /// Specific additions suggested based on the comparison.
+    pub suggested_additions: Vec<String>,
+}
+
+/// Tips for building with AI agents effectively.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgenticTips {
+    /// How the human uses their AI agent (prompting, context, commands).
+    pub human_workflows: Vec<String>,
+    /// Techniques the agent itself has found effective.
+    pub agent_techniques: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// CoffeeChatOutput — bundles both briefings
+// ---------------------------------------------------------------------------
+
+/// The complete output of a coffee chat: one document for the human,
+/// one structured memo for the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoffeeChatOutput {
+    pub human_briefing: HumanBriefing,
+    pub agent_memo: AgentMemo,
+    /// Legacy briefing for backward compatibility.
+    pub legacy_briefing: ChatBriefing,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +348,29 @@ mod tests {
         let briefing = ChatBriefing::default();
         assert!(briefing.what_building.is_empty());
         assert!(briefing.learnings.is_empty());
+    }
+
+    #[test]
+    fn human_briefing_default() {
+        let hb = HumanBriefing::default();
+        assert!(hb.project_arc.is_empty());
+        assert!(hb.conversation_starters.is_empty());
+    }
+
+    #[test]
+    fn agent_memo_default() {
+        let memo = AgentMemo::default();
+        assert!(memo.setup_diffs.they_have.is_empty());
+        assert!(memo.follow_up_actions.is_empty());
+    }
+
+    #[test]
+    fn coffee_chat_output_serialization() {
+        let output = CoffeeChatOutput::default();
+        let json = serde_json::to_string(&output).unwrap();
+        let deser: CoffeeChatOutput = serde_json::from_str(&json).unwrap();
+        assert!(deser.human_briefing.project_arc.is_empty());
+        assert!(deser.agent_memo.agentic_tips.human_workflows.is_empty());
     }
 
     #[test]

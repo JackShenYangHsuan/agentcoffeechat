@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::chat_engine::ChatResult;
-use agentcoffeechat_core::types::{ChatBriefing, Message};
+use agentcoffeechat_core::types::{ChatBriefing, HumanBriefing, Message};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -71,13 +71,34 @@ pub fn save_chat(peer_name: &str, result: &ChatResult) -> Result<PathBuf> {
         )
     })?;
 
-    // Write briefing.md
+    // Write briefing.md (legacy format, for backward compat)
     let briefing_path = chat_dir.join("briefing.md");
     let briefing_md = format_briefing_md(&result.briefing, peer_name);
     std::fs::write(&briefing_path, &briefing_md).with_context(|| {
         format!(
             "failed to write briefing: {}",
             briefing_path.display()
+        )
+    })?;
+
+    // Write briefing-human.md (new human-facing pre-meeting note)
+    let human_path = chat_dir.join("briefing-human.md");
+    let human_md = format_human_briefing_md(&result.output.human_briefing, peer_name);
+    std::fs::write(&human_path, &human_md).with_context(|| {
+        format!(
+            "failed to write human briefing: {}",
+            human_path.display()
+        )
+    })?;
+
+    // Write briefing-agent.json (structured agent memo)
+    let agent_path = chat_dir.join("briefing-agent.json");
+    let agent_json = serde_json::to_string_pretty(&result.output.agent_memo)
+        .unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(&agent_path, &agent_json).with_context(|| {
+        format!(
+            "failed to write agent memo: {}",
+            agent_path.display()
         )
     })?;
 
@@ -251,6 +272,53 @@ fn format_briefing_md(briefing: &ChatBriefing, peer_name: &str) -> String {
         out.push_str("## Ideas to explore\n");
         for item in &briefing.ideas_to_explore {
             out.push_str(&format!("- {}\n", item));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Format a human briefing as Markdown.
+fn format_human_briefing_md(briefing: &HumanBriefing, peer_name: &str) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("# Pre-Meeting Briefing: {}\n\n", peer_name));
+
+    if !briefing.project_arc.is_empty() {
+        out.push_str("## Their project\n");
+        out.push_str(&briefing.project_arc);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.current_focus.is_empty() {
+        out.push_str("## What they're building now\n");
+        out.push_str(&briefing.current_focus);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.setup_comparison.is_empty() {
+        out.push_str("## Their setup vs yours\n");
+        out.push_str(&briefing.setup_comparison);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.overlaps.is_empty() {
+        out.push_str("## Where your work overlaps\n");
+        out.push_str(&briefing.overlaps);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.candid_takes.is_empty() {
+        out.push_str("## Candid takes\n");
+        out.push_str(&briefing.candid_takes);
+        out.push_str("\n\n");
+    }
+
+    if !briefing.conversation_starters.is_empty() {
+        out.push_str("## Conversation starters\n");
+        for starter in &briefing.conversation_starters {
+            out.push_str(&format!("- {}\n", starter));
         }
         out.push('\n');
     }

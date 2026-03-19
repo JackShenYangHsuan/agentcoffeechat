@@ -599,6 +599,10 @@ async fn handle_command(
                             "tips": result.briefing.tips,
                             "ideas_to_explore": result.briefing.ideas_to_explore,
                         },
+                        "human_briefing": serde_json::to_value(&result.output.human_briefing)
+                            .unwrap_or_default(),
+                        "agent_memo": serde_json::to_value(&result.output.agent_memo)
+                            .unwrap_or_default(),
                         "briefing_text": briefing_text,
                         "saved_to": save_path,
                     });
