@@ -1338,6 +1338,10 @@ async fn main() -> Result<()> {
                                 &proof_code,
                             ) {
                                 Err(message) => {
+                                    eprintln!(
+                                        "[daemon] Incoming chat rejected from {}: {}",
+                                        peer_name, message
+                                    );
                                     let _ = transport::send_wire_message(
                                         &mut quic_send,
                                         &WireMessage::Error { message },
@@ -1346,7 +1350,9 @@ async fn main() -> Result<()> {
                                     let _ = quic_send.finish();
                                     continue;
                                 }
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    println!("[daemon] Incoming chat validated for {}", peer_name);
+                                }
                             }
                         }
 

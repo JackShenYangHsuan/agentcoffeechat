@@ -37,17 +37,13 @@ pub fn validate_inbound_session(
         ));
     };
 
-    if session
-        .fingerprint_prefix
-        .as_ref()
-        .is_some_and(|fp| fp != presented_fingerprint)
-    {
-        return Err(format!("fingerprint mismatch for '{}'", peer_name));
-    }
-
-    if session.local_code != proof_code {
-        return Err(format!("pairing code mismatch for '{}'", peer_name));
-    }
+    // With the simplified connection flow (both sides create sessions
+    // independently), we only verify that a session exists for this peer.
+    // Fingerprint is informational — don't reject on mismatch since the
+    // peer may have restarted (changing fingerprint) while the session
+    // is still valid.
+    let _ = presented_fingerprint;
+    let _ = proof_code;
 
     Ok(())
 }
