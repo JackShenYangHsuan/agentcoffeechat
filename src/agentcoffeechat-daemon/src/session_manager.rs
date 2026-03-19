@@ -1,17 +1,54 @@
 use std::collections::HashMap;
 
 use agentcoffeechat_core::Session;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
-/// Manages active chat sessions, keyed by peer name.
+/// A pending incoming connection request awaiting user approval.
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    pub peer_name: String,
+    pub fingerprint_prefix: String,
+    pub received_at: DateTime<Utc>,
+}
+
+/// Manages active chat sessions and pending connection requests.
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
+    pending: Vec<PendingRequest>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Add a pending connection request (from an incoming peer).
+    pub fn add_pending(&mut self, peer_name: &str, fingerprint_prefix: &str) {
+        // Don't duplicate if already pending.
+        if self.pending.iter().any(|p| p.peer_name == peer_name) {
+            return;
+        }
+        self.pending.push(PendingRequest {
+            peer_name: peer_name.to_string(),
+            fingerprint_prefix: fingerprint_prefix.to_string(),
+            received_at: Utc::now(),
+        });
+    }
+
+    /// List all pending requests.
+    pub fn list_pending(&self) -> &[PendingRequest] {
+        &self.pending
+    }
+
+    /// Remove and return a pending request by peer name.
+    pub fn take_pending(&mut self, peer_name: &str) -> Option<PendingRequest> {
+        if let Some(idx) = self.pending.iter().position(|p| p.peer_name == peer_name) {
+            Some(self.pending.remove(idx))
+        } else {
+            None
         }
     }
 

@@ -50,7 +50,10 @@ The user speaks natural language — you handle all the CLI commands via the Bas
 ## Commands (all support --json, `acc` is alias for `agentcoffeechat`)
 - acc start — Start daemon
 - acc peers --json — List nearby peers
-- acc connect <name> --json — Connect (3-word code exchange)
+- acc connect <name> --json — Connect to peer (sends approval request)
+- acc pending --json — List pending incoming connection requests
+- acc approve <name> --json — Approve a pending connection
+- acc deny <name> --json — Deny a pending connection
 - acc disconnect [name] — End session
 - acc sessions --json — List active sessions
 - acc chat --to <name> --json — Coffee chat
@@ -61,10 +64,16 @@ The user speaks natural language — you handle all the CLI commands via the Bas
 
 ## Connection flow
 1. acc peers --json — find nearby peers
-2. acc connect <name> --json — get YOUR 3-word code
-3. Tell user: "Say to <name>: Hey, want to connect on AgentCoffeeChat? My code is <code>."
-4. Ask user for peer's code, pass to acc connect
-5. Both sides initiate independently. Session lasts 1 hour.
+2. acc connect <name> --json — sends connection request to peer
+3. Peer's agent sees the request via acc pending --json and asks their user to approve
+4. Once approved on both sides, session is active for 1 hour
+
+## Incoming connection requests
+- Periodically check `acc pending --json` for incoming requests
+- When a request is found, ask the user: "<peer_name> wants to connect. Allow?
+- If yes: run `acc approve <name> --json`
+- If no: run `acc deny <name> --json`
+- IMPORTANT: Always ask the user before approving. Never auto-approve.
 
 ## After a chat
 - Present briefing: What they're building, Interesting learnings, Tips, Ideas to explore

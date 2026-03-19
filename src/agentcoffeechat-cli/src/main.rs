@@ -118,6 +118,21 @@ enum Commands {
 
     /// Show daemon logs
     Logs,
+
+    /// List pending connection requests
+    Pending,
+
+    /// Approve a pending connection request
+    Approve {
+        /// Peer name to approve
+        name: String,
+    },
+
+    /// Deny a pending connection request
+    Deny {
+        /// Peer name to deny
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +997,40 @@ fn handle_logs(json: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Pending / Approve / Deny handlers
+// ---------------------------------------------------------------------------
+
+fn handle_pending(json: bool) {
+    let mut client = connect_or_exit(json);
+    let resp = send_or_exit(&mut client, &DaemonCommand::ListPending, json);
+    print_response(&resp, json);
+}
+
+fn handle_approve(name: &str, json: bool) {
+    let mut client = connect_or_exit(json);
+    let resp = send_or_exit(
+        &mut client,
+        &DaemonCommand::ApproveConnection {
+            peer_name: name.to_string(),
+        },
+        json,
+    );
+    print_response(&resp, json);
+}
+
+fn handle_deny(name: &str, json: bool) {
+    let mut client = connect_or_exit(json);
+    let resp = send_or_exit(
+        &mut client,
+        &DaemonCommand::DenyConnection {
+            peer_name: name.to_string(),
+        },
+        json,
+    );
+    print_response(&resp, json);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1013,5 +1062,8 @@ fn main() {
         Commands::Doctor => handle_doctor(json),
         Commands::Invite => handle_invite(json),
         Commands::Logs => handle_logs(json),
+        Commands::Pending => handle_pending(json),
+        Commands::Approve { name } => handle_approve(name, json),
+        Commands::Deny { name } => handle_deny(name, json),
     }
 }

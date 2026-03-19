@@ -49,6 +49,16 @@ pub enum WireMessage {
     Error {
         message: String,
     },
+    /// Connection request — asks the remote peer for approval.
+    ConnectionRequest {
+        peer_name: String,
+        fingerprint_prefix: String,
+    },
+    /// Response to a connection request.
+    ConnectionResponse {
+        approved: bool,
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -248,6 +248,31 @@ async fn handle_command(
                 ));
             };
 
+            // Send a connection request to the peer's daemon over QUIC
+            // so they get a pending approval prompt.
+            let peer_info = {
+                let peers = state.peers.lock().await;
+                peers.iter().find(|p| p.name == peer_name).cloned()
+            };
+            if let Some(ref peer) = peer_info {
+                if let (Some(addr), Some(t)) = (peer.address, state.transport.as_ref()) {
+                    let socket_addr = SocketAddr::new(addr, peer.quic_port);
+                    let config = state.config.lock().await.clone();
+                    if let Ok(conn) = t.connect(socket_addr).await {
+                        if let Ok((mut send, _recv)) = conn.open_stream().await {
+                            let req = WireMessage::ConnectionRequest {
+                                peer_name: config.peer_label(),
+                                fingerprint_prefix: config.fingerprint_prefix.clone(),
+                            };
+                            let _ = transport::send_wire_message(&mut send, &req).await;
+                            let _ = send.finish();
+                            println!("[daemon] Sent connection request to {}", peer_name);
+                        }
+                    }
+                }
+            }
+
+            // Create our local session immediately (we initiated).
             let mut mgr = state.session_mgr.lock().await;
             mgr.create_session(
                 &peer_name,
@@ -257,7 +282,7 @@ async fn handle_command(
             );
             println!("[daemon] Started session with {}", peer_name);
             DaemonResponse::success(format!(
-                "session started with {} for 1 hour",
+                "session started with {} for 1 hour — waiting for peer approval",
                 peer_name
             ))
         }
@@ -829,6 +854,66 @@ async fn handle_command(
             println!("[daemon] Shutdown requested via IPC");
             let _ = shutdown_tx.send(true);
             DaemonResponse::success("shutting down")
+        }
+
+        DaemonCommand::ListPending => {
+            let mgr = state.session_mgr.lock().await;
+            let pending = mgr.list_pending();
+            let list: Vec<serde_json::Value> = pending
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "peer_name": p.peer_name,
+                        "fingerprint_prefix": p.fingerprint_prefix,
+                        "received_at": p.received_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            DaemonResponse::success_with_data(
+                format!("{} pending request(s)", list.len()),
+                serde_json::Value::Array(list),
+            )
+        }
+
+        DaemonCommand::ApproveConnection { peer_name } => {
+            let mut mgr = state.session_mgr.lock().await;
+            match mgr.take_pending(&peer_name) {
+                Some(req) => {
+                    let code = agentcoffeechat_core::generate_three_word_code();
+                    mgr.create_session(
+                        &peer_name,
+                        &code,
+                        &code,
+                        Some(req.fingerprint_prefix),
+                    );
+                    println!("[daemon] Approved connection from {}", peer_name);
+                    DaemonResponse::success(format!(
+                        "connection from '{}' approved — session active for 1 hour",
+                        peer_name
+                    ))
+                }
+                None => DaemonResponse::error(format!(
+                    "no pending request from '{}'",
+                    peer_name
+                )),
+            }
+        }
+
+        DaemonCommand::DenyConnection { peer_name } => {
+            let mut mgr = state.session_mgr.lock().await;
+            match mgr.take_pending(&peer_name) {
+                Some(_) => {
+                    println!("[daemon] Denied connection from {}", peer_name);
+                    DaemonResponse::success(format!(
+                        "connection from '{}' denied",
+                        peer_name
+                    ))
+                }
+                None => DaemonResponse::error(format!(
+                    "no pending request from '{}'",
+                    peer_name
+                )),
+            }
         }
     }
 }
@@ -1475,6 +1560,19 @@ async fn main() -> Result<()> {
                                 }
                             }
                         });
+                    }
+                    WireMessage::ConnectionRequest {
+                        peer_name,
+                        fingerprint_prefix,
+                    } => {
+                        println!(
+                            "[daemon] Incoming connection request from '{}' (fp={})",
+                            peer_name, fingerprint_prefix
+                        );
+                        // Store as pending — user must approve via `acc approve`.
+                        let mut mgr = accept_state.session_mgr.lock().await;
+                        mgr.add_pending(&peer_name, &fingerprint_prefix);
+                        let _ = quic_send.finish();
                     }
                     other => {
                         eprintln!(
