@@ -386,15 +386,23 @@ async fn handle_command(
             };
 
             if let Err(e) = transport::send_wire_message(&mut quic_send, &request).await {
-                return DaemonResponse::error(format!("ask failed: {}", e));
+                return DaemonResponse::error(format!("ask failed (send): {}", e));
             }
+
+            // Wait for the response with a 60-second timeout.
+            // Keep the send stream open until we get the response.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                transport::recv_wire_message(&mut quic_recv),
+            ).await;
+
             let _ = quic_send.finish();
 
-            match transport::recv_wire_message(&mut quic_recv).await {
-                Ok(WireMessage::AskResponse {
-                    answer,
-                    duration_ms,
-                }) => {
+            match response {
+                Err(_) => {
+                    DaemonResponse::error("ask timed out (60s) waiting for peer response".to_string())
+                }
+                Ok(Ok(WireMessage::AskResponse { answer, duration_ms })) => {
                     let data = serde_json::json!({
                         "answer": answer,
                         "duration_ms": duration_ms,
@@ -402,14 +410,13 @@ async fn handle_command(
                     });
                     DaemonResponse::success_with_data("question answered", data)
                 }
-                Ok(WireMessage::Error { message }) => {
-                    DaemonResponse::error(format!("ask failed: {}", message))
+                Ok(Ok(WireMessage::Error { message })) => {
+                    DaemonResponse::error(format!("peer rejected ask: {}", message))
                 }
-                Ok(other) => DaemonResponse::error(format!(
-                    "ask failed: unexpected response {:?}",
-                    other
+                Ok(Ok(other)) => DaemonResponse::error(format!(
+                    "ask failed: unexpected response {:?}", other
                 )),
-                Err(e) => DaemonResponse::error(format!("ask failed: {}", e)),
+                Ok(Err(e)) => DaemonResponse::error(format!("ask failed (recv): {}", e)),
             }
         }
 
