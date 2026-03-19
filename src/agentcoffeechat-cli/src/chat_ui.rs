@@ -273,6 +273,11 @@ pub fn replay_chat(display: &ChatDisplay, data: &serde_json::Value) {
     if let Some(path) = saved_to {
         println!();
         display.show_status(&format!("Saved to: {}", path));
+    } else if message_count > 0 {
+        println!();
+        display.show_status(
+            "Warning: chat was not saved to disk. Copy the briefing above if needed.",
+        );
     }
 
     // Post-chat nudges.

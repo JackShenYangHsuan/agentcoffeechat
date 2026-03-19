@@ -538,6 +538,14 @@ fn handle_connect(name: &str, peer_code: Option<&str>, json: bool) {
         return;
     }
 
+    if fingerprint_prefix.is_none() && !json {
+        eprintln!(
+            "Warning: '{}' is not in the discovered peers list. The session will be created \
+             but you won't be able to chat until they appear. Run 'acc peers' to see who's nearby.",
+            name
+        );
+    }
+
     let begin = send_or_exit(
         &mut client,
         &DaemonCommand::BeginPairing {

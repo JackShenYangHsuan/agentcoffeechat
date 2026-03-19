@@ -383,6 +383,14 @@ impl AgentSession {
         .context("timed out waiting for agent response")?
         .context("failed to read agent output")?;
 
+        if !output.status.success() {
+            bail!(
+                "{} exited with status {} — stderr suppressed",
+                self.ai_tool,
+                output.status,
+            );
+        }
+
         let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if response.is_empty() {
@@ -991,6 +999,9 @@ impl ChatEngine {
 
         let raw_intro = session.query(&conversation_history).await?;
         let intro = self.sanitize_and_clean(&raw_intro, &transcript_tx).await;
+        if intro.is_empty() {
+            bail!("agent produced empty intro after sanitization");
+        }
         conversation_history.push_str(&format!("\n\nYOU: {}", intro));
 
         turn += 1;
@@ -1006,133 +1017,154 @@ impl ChatEngine {
         conversation_history.push_str(&format!("\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_intro));
 
         // ---------------------------------------------------------------
-        // Phases 2-4: Guided discussion rounds
+        // Phases 2-4 + Wrapup: wrapped so mid-chat failures still
+        // produce a briefing from the partial transcript.
         // ---------------------------------------------------------------
-        let guided_phases: &[(&str, &str, &str, &str)] = &[
-            ("deep_dive",  "Deep Dive",            PHASE2_DEEPDIVE_PROMPT,
-             "[2/6] Deep Dive \u{2014} agents discussing architecture, failures, and trade-offs..."),
-            ("compare",    "Compare & Collaborate", PHASE3_COMPARE_PROMPT,
-             "[3/6] Compare & Collaborate \u{2014} agents comparing setups and finding overlaps..."),
-            ("blindspots", "Blindspots & Tips",     PHASE4_BLINDSPOTS_PROMPT,
-             "[4/6] Blindspots & Tips \u{2014} agents sharing observations and recommendations..."),
-        ];
+        let conversation_result: Result<()> = async {
+            // -----------------------------------------------------------
+            // Phases 2-4: Guided discussion rounds
+            // -----------------------------------------------------------
+            let guided_phases: &[(&str, &str, &str, &str)] = &[
+                ("deep_dive",  "Deep Dive",            PHASE2_DEEPDIVE_PROMPT,
+                 "[2/6] Deep Dive \u{2014} agents discussing architecture, failures, and trade-offs..."),
+                ("compare",    "Compare & Collaborate", PHASE3_COMPARE_PROMPT,
+                 "[3/6] Compare & Collaborate \u{2014} agents comparing setups and finding overlaps..."),
+                ("blindspots", "Blindspots & Tips",     PHASE4_BLINDSPOTS_PROMPT,
+                 "[4/6] Blindspots & Tips \u{2014} agents sharing observations and recommendations..."),
+            ];
 
-        for &(phase_id, phase_label, phase_prompt, status_msg) in guided_phases {
-            let _ = transcript_tx
-                .send(ChatEvent::Phase(phase_id.into()))
-                .await;
-            let _ = transcript_tx
-                .send(ChatEvent::Status(status_msg.into()))
-                .await;
+            for &(phase_id, phase_label, phase_prompt, status_msg) in guided_phases {
+                let _ = transcript_tx
+                    .send(ChatEvent::Phase(phase_id.into()))
+                    .await;
+                let _ = transcript_tx
+                    .send(ChatEvent::Status(status_msg.into()))
+                    .await;
 
-            // Inject the phase prompt into conversation history.
-            conversation_history.push_str(&format!("\n\n{}", phase_prompt));
+                // Inject the phase prompt into conversation history.
+                conversation_history.push_str(&format!("\n\n{}", phase_prompt));
 
-            let mut phase_msgs: usize = 0;
+                let mut phase_msgs: usize = 0;
 
-            loop {
-                if phase_msgs >= MAX_FOLLOWUPS_PER_PHASE {
-                    break;
-                }
-
-                // Our agent responds with a dynamic follow-up based on what the peer said.
-                let followup_instruction = if phase_msgs == 0 {
-                    // First message in phase: respond to the phase prompt with our info.
-                    format!(
-                        "\n\nRespond to the current phase topic. Share your own experience and ask the other agent a specific follow-up question based on their earlier messages. Stay on the current topic: {}.",
-                        phase_label
-                    )
-                } else {
-                    // Subsequent messages: dig deeper based on what the peer just said.
-                    format!(
-                        "\n\nBased on what the peer just shared, ask a specific follow-up question that digs deeper. Reference something concrete they mentioned. Also share any related experience of your own. Stay on the current topic: {}.",
-                        phase_label
-                    )
-                };
-                conversation_history.push_str(&followup_instruction);
-                let raw = match session.query(&conversation_history).await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                if raw.is_empty() {
-                    break;
-                }
-
-                let local_done = raw.contains(DONE_SENTINEL);
-                let response = self.sanitize_and_clean(&raw, &transcript_tx).await;
-                conversation_history.push_str(&format!("\n\nYOU: {}", response));
-
-                turn += 1;
-                transcript.push(self.local_message(&response, MessagePhase::Exchange, turn));
-                let _ = transcript_tx.send(ChatEvent::LocalMessage(response.clone())).await;
-                send_tx.send(response).await.context("failed to send message")?;
-                phase_msgs += 1;
-
-                // Always consume one peer reply before advancing phases. If we
-                // break immediately after our own [DONE], the peer's in-flight
-                // reply stays queued and gets misattributed to the next phase.
-                let peer_msg = match tokio::time::timeout(
-                    std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
-                    recv_rx.recv(),
-                ).await {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => {
-                        let _ = transcript_tx
-                            .send(ChatEvent::Status("Peer disconnected.".into()))
-                            .await;
+                loop {
+                    if phase_msgs >= MAX_FOLLOWUPS_PER_PHASE {
                         break;
                     }
-                    Err(_) => {
-                        let _ = transcript_tx
-                            .send(ChatEvent::Status("Timed out waiting for peer.".into()))
-                            .await;
+
+                    // Our agent responds with a dynamic follow-up based on what the peer said.
+                    let followup_instruction = if phase_msgs == 0 {
+                        // First message in phase: respond to the phase prompt with our info.
+                        format!(
+                            "\n\nRespond to the current phase topic. Share your own experience and ask the other agent a specific follow-up question based on their earlier messages. Stay on the current topic: {}.",
+                            phase_label
+                        )
+                    } else {
+                        // Subsequent messages: dig deeper based on what the peer just said.
+                        format!(
+                            "\n\nBased on what the peer just shared, ask a specific follow-up question that digs deeper. Reference something concrete they mentioned. Also share any related experience of your own. Stay on the current topic: {}.",
+                            phase_label
+                        )
+                    };
+                    conversation_history.push_str(&followup_instruction);
+                    let raw = match session.query(&conversation_history).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    if raw.is_empty() {
                         break;
                     }
-                };
 
-                turn += 1;
-                transcript.push(peer_message(&peer_msg, MessagePhase::Exchange, turn));
-                let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_msg.clone())).await;
-                conversation_history.push_str(&format!(
-                    "\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_msg
-                ));
+                    let local_done = raw.contains(DONE_SENTINEL);
+                    let cleaned = self.sanitize_and_clean(&raw, &transcript_tx).await;
+                    let response = if cleaned.is_empty() {
+                        "I don't have more to add on this topic.".to_string()
+                    } else {
+                        cleaned
+                    };
+                    conversation_history.push_str(&format!("\n\nYOU: {}", response));
 
-                let peer_done = peer_msg.contains(DONE_SENTINEL);
-                if should_advance_phase_after_peer_turn(local_done, peer_done) {
-                    break;
+                    turn += 1;
+                    transcript.push(self.local_message(&response, MessagePhase::Exchange, turn));
+                    let _ = transcript_tx.send(ChatEvent::LocalMessage(response.clone())).await;
+                    send_tx.send(response).await.context("failed to send message")?;
+                    phase_msgs += 1;
+
+                    // Always consume one peer reply before advancing phases. If we
+                    // break immediately after our own [DONE], the peer's in-flight
+                    // reply stays queued and gets misattributed to the next phase.
+                    let peer_msg = match tokio::time::timeout(
+                        std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
+                        recv_rx.recv(),
+                    ).await {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => {
+                            bail!("peer disconnected");
+                        }
+                        Err(_) => {
+                            bail!("timed out waiting for peer");
+                        }
+                    };
+
+                    turn += 1;
+                    transcript.push(peer_message(&peer_msg, MessagePhase::Exchange, turn));
+                    let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_msg.clone())).await;
+                    conversation_history.push_str(&format!(
+                        "\n\n{}{}", FOLLOWUP_PROMPT_PREFIX, peer_msg
+                    ));
+
+                    let peer_done = peer_msg.contains(DONE_SENTINEL);
+                    if should_advance_phase_after_peer_turn(local_done, peer_done) {
+                        break;
+                    }
                 }
             }
-        }
 
-        // ---------------------------------------------------------------
-        // Phase 5: Wrapup
-        // ---------------------------------------------------------------
-        let _ = transcript_tx
-            .send(ChatEvent::Phase("wrapup".into()))
-            .await;
-        let _ = transcript_tx
-            .send(ChatEvent::Status("[5/6] Wrap-up \u{2014} agents exchanging final takeaways...".into()))
-            .await;
+            // -----------------------------------------------------------
+            // Phase 5: Wrapup
+            // -----------------------------------------------------------
+            let _ = transcript_tx
+                .send(ChatEvent::Phase("wrapup".into()))
+                .await;
+            let _ = transcript_tx
+                .send(ChatEvent::Status("[5/6] Wrap-up \u{2014} agents exchanging final takeaways...".into()))
+                .await;
 
-        conversation_history.push_str(&format!("\n\n{}", WRAPUP_PROMPT));
-        let raw_wrapup = session.query(&conversation_history).await
-            .unwrap_or_else(|_| "Thanks for the chat! It was great connecting.".to_string());
-        let wrapup = self.sanitize_and_clean(&raw_wrapup, &transcript_tx).await;
-        conversation_history.push_str(&format!("\n\nYOU: {}", wrapup));
+            conversation_history.push_str(&format!("\n\n{}", WRAPUP_PROMPT));
+            let raw_wrapup = session.query(&conversation_history).await
+                .unwrap_or_else(|_| "Thanks for the chat! It was great connecting.".to_string());
+            let cleaned_wrapup = self.sanitize_and_clean(&raw_wrapup, &transcript_tx).await;
+            let wrapup = if cleaned_wrapup.is_empty() {
+                "I don't have more to add on this topic.".to_string()
+            } else {
+                cleaned_wrapup
+            };
+            conversation_history.push_str(&format!("\n\nYOU: {}", wrapup));
 
-        turn += 1;
-        transcript.push(self.local_message(&wrapup, MessagePhase::Closing, turn));
-        let _ = transcript_tx.send(ChatEvent::LocalMessage(wrapup.clone())).await;
-        send_tx.send(wrapup).await.context("failed to send wrapup")?;
-
-        // Wait for peer's wrapup (best-effort).
-        if let Ok(Some(peer_wrapup)) = tokio::time::timeout(
-            std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
-            recv_rx.recv(),
-        ).await {
             turn += 1;
-            transcript.push(peer_message(&peer_wrapup, MessagePhase::Closing, turn));
-            let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_wrapup)).await;
+            transcript.push(self.local_message(&wrapup, MessagePhase::Closing, turn));
+            let _ = transcript_tx.send(ChatEvent::LocalMessage(wrapup.clone())).await;
+            send_tx.send(wrapup).await.context("failed to send wrapup")?;
+
+            // Wait for peer's wrapup (best-effort).
+            if let Ok(Some(peer_wrapup)) = tokio::time::timeout(
+                std::time::Duration::from_secs(PEER_MESSAGE_TIMEOUT_SECS),
+                recv_rx.recv(),
+            ).await {
+                turn += 1;
+                transcript.push(peer_message(&peer_wrapup, MessagePhase::Closing, turn));
+                let _ = transcript_tx.send(ChatEvent::RemoteMessage(peer_wrapup)).await;
+            }
+
+            Ok(())
+        }.await;
+
+        if let Err(e) = conversation_result {
+            eprintln!("[chat_engine] Mid-chat failure: {:#}", e);
+            let _ = transcript_tx
+                .send(ChatEvent::Status(
+                    "Peer disconnected. Generating briefing from partial transcript...".into(),
+                ))
+                .await;
         }
 
         // ---------------------------------------------------------------
@@ -1255,6 +1287,45 @@ impl ChatEngine {
         result.text
     }
 
+    /// Sanitize a single string field through the pipeline.
+    /// Returns "[redacted]" if the field is blocked.
+    fn sanitize_field(&self, field: &str) -> String {
+        let result = self.sanitizer.run(field);
+        if result.blocked {
+            "[redacted]".to_string()
+        } else {
+            result.text
+        }
+    }
+
+    /// Sanitize a Vec<String> field — each element through the pipeline.
+    fn sanitize_vec_field(&self, fields: &[String]) -> Vec<String> {
+        fields.iter().map(|f| self.sanitize_field(f)).collect()
+    }
+
+    /// Run the sanitization pipeline over every text field of a HumanBriefing.
+    fn sanitize_human_briefing_fields(&self, briefing: &mut HumanBriefing) {
+        briefing.project_arc = self.sanitize_field(&briefing.project_arc);
+        briefing.current_focus = self.sanitize_field(&briefing.current_focus);
+        briefing.setup_comparison = self.sanitize_field(&briefing.setup_comparison);
+        briefing.overlaps = self.sanitize_field(&briefing.overlaps);
+        briefing.candid_takes = self.sanitize_field(&briefing.candid_takes);
+        briefing.conversation_starters = self.sanitize_vec_field(&briefing.conversation_starters);
+    }
+
+    /// Run the sanitization pipeline over every text field of an AgentMemo.
+    fn sanitize_agent_memo_fields(&self, memo: &mut AgentMemo) {
+        memo.setup_diffs.they_have = self.sanitize_vec_field(&memo.setup_diffs.they_have);
+        memo.setup_diffs.we_have = self.sanitize_vec_field(&memo.setup_diffs.we_have);
+        memo.setup_diffs.suggested_additions = self.sanitize_vec_field(&memo.setup_diffs.suggested_additions);
+        memo.workflow_improvements = self.sanitize_vec_field(&memo.workflow_improvements);
+        memo.debottleneck_ideas = self.sanitize_vec_field(&memo.debottleneck_ideas);
+        memo.blindspots_surfaced = self.sanitize_vec_field(&memo.blindspots_surfaced);
+        memo.agentic_tips.human_workflows = self.sanitize_vec_field(&memo.agentic_tips.human_workflows);
+        memo.agentic_tips.agent_techniques = self.sanitize_vec_field(&memo.agentic_tips.agent_techniques);
+        memo.follow_up_actions = self.sanitize_vec_field(&memo.follow_up_actions);
+    }
+
     /// Create a local message for the transcript.
     fn local_message(&self, body: &str, phase: MessagePhase, turn: u32) -> Message {
         Message::new(
@@ -1341,12 +1412,14 @@ impl ChatEngine {
 
         let json_str = extract_json_object(&raw).unwrap_or_else(|| raw.clone());
 
-        let briefing: HumanBriefing = serde_json::from_str(&json_str).unwrap_or_else(|_| {
+        let mut briefing: HumanBriefing = serde_json::from_str(&json_str).unwrap_or_else(|_| {
             HumanBriefing {
                 project_arc: raw.lines().next().unwrap_or("Unknown").to_string(),
                 ..Default::default()
             }
         });
+
+        self.sanitize_human_briefing_fields(&mut briefing);
 
         Ok(briefing)
     }
@@ -1379,7 +1452,9 @@ impl ChatEngine {
 
         let json_str = extract_json_object(&raw).unwrap_or_else(|| raw.clone());
 
-        let memo: AgentMemo = serde_json::from_str(&json_str).unwrap_or_default();
+        let mut memo: AgentMemo = serde_json::from_str(&json_str).unwrap_or_default();
+
+        self.sanitize_agent_memo_fields(&mut memo);
 
         Ok(memo)
     }
